@@ -450,7 +450,7 @@ describe('devibe client', () => {
     await pickKeys([`${S0}web/src/checkout.ts#checkout`, `${S0}web/src/cart.ts#Cart.total`]);
     await page.keyboard.press('f');
     await idle();
-    const links = await state(() => window.devibe.state.linkList.map((e) => ({ dir: e.dir, a: window.devibe.state.T.N[e.a].key, b: window.devibe.state.T.N[e.b].key, z: e.pts?.[0]?.[2] ?? 0 })));
+    const links = await state(() => window.devibe.state.linkList.map((e) => ({ dir: e.dir, a: window.devibe.state.T.N[e.a].key, b: window.devibe.state.T.N[e.b].key, z: e.pts?.[2] ?? 0 })));
     assert.ok(links.some((e) => e.dir === 'inside' && e.a.endsWith('#checkout') && e.b.endsWith('#Cart.total')), JSON.stringify(links));
     assert.ok(links.some((e) => e.dir === 'out' && e.a.endsWith('#checkout') && e.b.includes('#')), 'function-level ends');
     assert.ok(links.some((e) => e.dir === 'in'));

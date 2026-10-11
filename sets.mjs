@@ -244,6 +244,18 @@ export function levels(ids, links) {
   return { comp, compSize, level, maxL, levelOf: (id) => (comp.has(id) ? level[comp.get(id)] : -1) };
 }
 
+// Parts at a rank that sit in a dependency loop, and every part above them.
+export function loopsAt(I, rank) {
+  return memo(I, 'loops:' + rank, () => {
+    const inLoop = new Set(), above = new Set();
+    for (const g of strongGroups(liftGraph(I, rank).out)) for (const id of g) {
+      inLoop.add(id);
+      for (let p = id; p > 0 && !above.has(p); p = I.N[p].up) above.add(p);
+    }
+    return { inLoop, above };
+  });
+}
+
 export function levelsAt(I, rank) {
   return memo(I, 'levels:' + rank, () => { const g = liftGraph(I, rank); return levels(g.ids, g.links); });
 }
@@ -839,5 +851,13 @@ export function recipeName(recipe, rules = []) {
   else if (first.legend) base = `color ${first.legend.label ?? first.legend.key ?? `${Math.round(first.legend.lo * 100)}–${Math.round(first.legend.hi * 100)}%`}`;
   else if (first.level != null) base = `level ${first.level}`;
   const words = { out: 'uses', in: 'used by', both: 'both ways', path: 'path', loop: 'loop', copies: 'copies', tests: 'tests', inside: 'inside', parent: 'parent' };
-  return [base, ...steps.map((s) => `+ ${words[s.grow] ?? s.grow}${s.depth === 'all' ? ' (all)' : s.depth > 1 ? ` ×${s.depth}` : ''}`)].join(' ');
+  // Repeated hops read as one: "+ uses + uses" is "+ uses ×2".
+  const runs = [];
+  for (const s of steps) {
+    const last = runs.at(-1);
+    const hops = ['out', 'in', 'both'].includes(s.grow) && s.depth !== 'all' ? s.depth ?? 1 : null;
+    if (last && hops && last.grow === s.grow && last.hops) last.hops += hops;
+    else runs.push({ grow: s.grow, hops, all: s.depth === 'all' });
+  }
+  return [base, ...runs.map((s) => `+ ${words[s.grow] ?? s.grow}${s.all ? ' (all)' : s.hops > 1 ? ` ×${s.hops}` : ''}`)].join(' ');
 }

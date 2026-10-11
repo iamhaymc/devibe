@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Workspace, makeSample } from './server.mjs';
 import {
-  index, liftTo, partsAt, liftGraph, levels, strongGroups, fanin, emptySet, grow, boundary, reach, parseQuery, matchQuery,
+  index, liftTo, partsAt, liftGraph, levels, strongGroups, loopsAt, fanin, emptySet, grow, boundary, reach, parseQuery, matchQuery,
   classify, classMatches, replay, recipeName, linkIndices, seedIds, setSummary, cleanSet,
 } from './sets.mjs';
 
@@ -88,6 +88,15 @@ describe('sets', () => {
     assert.ok(p.links.some((l) => l[0] === key('web/src/app.ts') && l[1] === key('web/src/cart.ts') && l[2] === '*'));
     assert.ok(p.links.some((l) => l[0] === key('web/src/cart.ts') && l[1] === key('web/src/checkout.ts')));
     assert.ok(!p.nodes.includes(key('web/src/api.ts')), 'off-path parts stay out');
+  });
+
+  test('loops at a rank list the parts in a loop and every part above them', () => {
+    const L = loopsAt(I, 3);
+    assert.equal(loopsAt(I, 3), L, 'cached per model');
+    assert.ok(L.inLoop.has(id('web/src/cart.ts')) && L.inLoop.has(id('web/src/checkout.ts')));
+    assert.ok(!L.inLoop.has(id('web/src/api.ts')));
+    assert.ok(L.above.has(id('web/src')) && L.above.has(id('web/src/cart.ts')));
+    assert.ok(!L.above.has(id('server')));
   });
 
   test('loop adds the rest of the strongly connected group', () => {
@@ -250,5 +259,7 @@ describe('sets', () => {
     assert.deepEqual(frozen.nodes, [key('web/src/cart.ts')], 'a set without a recipe drops missing keys');
     assert.equal(recipeName(recipe), 'find "in:web/src uses:Cart" + uses');
     assert.equal(recipeName([{ rule: 'copy' }], [{ id: 'copy', name: 'Copied code' }]), 'rule Copied code');
+    assert.equal(recipeName([{ seed: [] }, { grow: 'out' }, { grow: 'out' }, { grow: 'in', depth: 2 }, { grow: 'path' }]), 'selection + uses ×2 + used by ×2 + path');
+    assert.equal(recipeName([{ seed: [] }, { grow: 'out', depth: 'all' }, { grow: 'out' }]), 'selection + uses (all) + uses');
   });
 });

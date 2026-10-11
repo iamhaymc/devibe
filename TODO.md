@@ -12,7 +12,7 @@ Sorted by impact, highest first.
 - [audit] Optional shared review ledger stored in the repo, so a team can split and track review of generated code, and share saved sets.
 - [agent] Keep Explain answers as notes on the parts they explain: stored in the ledger with a text hash so they go stale like review marks, shown in the Selection panel and as marks on the map and roofs.
 - [view] Group the map by C# namespace or Java/Kotlin package instead of folders.
-- [perf] Move layout and the force simulation to a Web Worker so very large graphs (over 5,000 nodes) never block input.
+- [perf] Move the Map treemap and the Layers layout to the worker the Graph force layout already uses, so the first layout of very large repos (over 20,000 files) never blocks input.
 - [perf] Rebuild only the changed files' links on rescans of very large repos (over 50,000 files) instead of the whole model.
 - [agent] Show token use and cost per request, and let the user approve or reject each tool call as it happens.
 - [view] Bundle edges in the Graph layout (force-directed edge bundling) to tame dense graphs.

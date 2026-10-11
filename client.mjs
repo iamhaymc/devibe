@@ -8,6 +8,7 @@ import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import * as S from './sets.mjs';
 import { makeCity } from './city.mjs';
+import { simulate } from './force.mjs';
 
 const d3 = window.d3;
 
@@ -32,7 +33,7 @@ const PAINTS = [
   { id: 'reach', name: 'Reach' },
 ];
 const HEIGHTS = [
-  { id: 'same', name: 'Same as color' },
+  { id: 'same', name: 'As color' },
   { id: 'lines', name: 'Lines' },
   { id: 'cx', name: 'Complexity' },
   { id: 'churn', name: 'Churn' },
@@ -279,16 +280,22 @@ const wire = {
 
 // ───────────────────────────── Model ─────────────────────────────
 
+prep.uid = 0;
 function prep(m) {
   const I = S.index(m);
   const F = S.facts(I);
   for (const l of m.langs) if (!state.slots.has(l.id) && state.slots.size < 7) state.slots.set(l.id, state.slots.size);
-  return { ...I, I, issuesOf: F.issuesOf, sev: F.sev, count: F.count, cxMax: F.cxMax, scales: F.scales, now: F.now };
+  return { ...I, I, uid: ++prep.uid, issuesOf: F.issuesOf, sev: F.sev, count: F.count, cxMax: F.cxMax, scales: F.scales, now: F.now };
 }
 
 const node = (id) => state.T?.N[id];
 const idOf = (key) => state.T?.byKey.get(key) ?? -1;
-const selIds = () => state.set.nodes.map(idOf).filter((id) => id >= 0);
+// The set's node ids, cached per set and model. Callers must not change the array.
+let selCache = { set: null, T: null, ids: [] };
+function selIds() {
+  if (selCache.set !== state.set || selCache.T !== state.T) selCache = { set: state.set, T: state.T, ids: state.set.nodes.map(idOf).filter((id) => id >= 0) };
+  return selCache.ids;
+}
 const detailRank = () => DETAILS.find((d) => d.id === state.detail)?.rank ?? 3;
 const setEmpty = () => S.setSize(state.set) === 0;
 
@@ -309,7 +316,9 @@ function where(id) {
 
 // ───────────────────────────── Paint ─────────────────────────────
 
-const theme = () => THEMES[document.documentElement.dataset.resolved ?? 'dark'];
+// The resolved theme, set by applyTheme (reading the DOM on every call is slow).
+let THEME = THEMES.dark;
+const theme = () => THEME;
 
 function rampColor(t) {
   const r = theme().ramp;
@@ -382,8 +391,23 @@ function colorOf(cls, id) {
   return neutral;
 }
 
+// Fill colors by node for the current paint, computed once per paint,
+// Detail, model, theme, stage, and reach. Find, spotlight, and isolate only dim
+// them, so typing in Find never reclassifies the map.
+let paintCache = null;
+function paintRgb(id) {
+  const T = state.T;
+  const sig = `${state.paint}|${detailRank()}|${state.paint === 'reach' ? currentReach() && state.reach.key : ''}`;
+  if (!paintCache || paintCache.T !== T || paintCache.sig !== sig || paintCache.theme !== THEME || paintCache.stage !== state.stageIndex) {
+    paintCache = { T, sig, theme: THEME, stage: state.stageIndex, ctx: classCtx(), rgb: new Float32Array(T.n * 3).fill(-1) };
+  }
+  const a = paintCache.rgb;
+  if (a[id * 3] < 0) { const c = colorOf(classOf(id, state.paint, paintCache.ctx), id); a[id * 3] = c[0]; a[id * 3 + 1] = c[1]; a[id * 3 + 2] = c[2]; }
+  return a;
+}
+
 // Fill color for a node, by the current paint.
-const paintOf = (id) => colorOf(classOf(id), id);
+const paintOf = (id) => { const a = paintRgb(id); return [a[id * 3], a[id * 3 + 1], a[id * 3 + 2]]; };
 
 // Dimming: find results while typing, then isolate, then a spotlighted rule.
 function makeLit() {
@@ -569,7 +593,9 @@ function homeOf(T, id, mapLay) {
   return [0, 0];
 }
 
-function layGraph(T, mapLay) {
+// Graph nodes start at their place on the Map (scaled), then the force
+// layout (force.mjs) pulls linked parts together.
+function graphSeed(T, mapLay) {
   const N = T.N;
   const { ids, links } = liftGraph(T, detailRank());
   const radius = (id) => 2.2 + Math.sqrt(Math.max(1, N[id].lines)) * 0.85;
@@ -578,25 +604,16 @@ function layGraph(T, mapLay) {
   const G = Math.sqrt(area * 7) + 60;
   const mb = mapLay.bounds;
   const s = G / Math.max(mb.w, mb.h);
+  const jitter = (seed) => ((Math.sin(seed * 12.9898) * 43758.5453) % 1);
   for (const nd of nodes) {
     const [hx, hy] = homeOf(T, nd.id, mapLay);
     nd.hx = hx * s; nd.hy = hy * s;
-    const jitter = (seed) => ((Math.sin(seed * 12.9898) * 43758.5453) % 1);
     nd.x = nd.hx + jitter(nd.id) * 2; nd.y = nd.hy + jitter(nd.id + 7.7) * 2;
   }
-  const deg = new Map();
-  for (const e of links) { deg.set(e.a, (deg.get(e.a) ?? 0) + 1); deg.set(e.b, (deg.get(e.b) ?? 0) + 1); }
-  const simLinks = links.map((e) => ({ source: e.a, target: e.b, w: e.w }));
-  const sim = d3.forceSimulation(nodes)
-    .force('link', d3.forceLink(simLinks).id((d) => d.id).distance((l) => l.source.r + l.target.r + 14).strength((l) => 0.6 / Math.min(deg.get(l.source.id), deg.get(l.target.id))))
-    .force('charge', d3.forceManyBody().strength((d) => -12 - d.r * 2.4).distanceMax(G * 0.4).theta(0.95))
-    .force('collide', d3.forceCollide((d) => d.r + 2.2).strength(0.9))
-    .force('x', d3.forceX((d) => d.hx).strength(0.045))
-    .force('y', d3.forceY((d) => d.hy).strength(0.045))
-    .alphaDecay(0.028)
-    .stop();
-  const t0 = performance.now();
-  for (let i = 0; i < 360 && performance.now() - t0 < 1100; i++) sim.tick();
+  return { nodes, links, sim: links.map((e) => ({ source: e.a, target: e.b })), G };
+}
+
+function graphOf(T, { nodes, links }) {
   const items = [], rect = new Map();
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   for (const nd of nodes) {
@@ -609,6 +626,27 @@ function layGraph(T, mapLay) {
   const quad = d3.quadtree(nodes, (d) => d.x, (d) => d.y);
   if (!nodes.length) { x0 = y0 = 0; x1 = y1 = 100; }
   return { kind: 'graph', items, rect, quad, nodes, links, bounds: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } };
+}
+
+// Run the force layout in a worker; resolves to the nodes' new positions.
+// Falls back to running in place when workers are unavailable.
+const forceWorker = { w: null, seq: 0, waits: new Map() };
+function simulateOff(seed) {
+  const F = forceWorker;
+  try {
+    if (!F.w) {
+      F.w = new Worker(new URL('./force.mjs?worker', import.meta.url), { type: 'module' });
+      F.w.onmessage = (e) => { F.waits.get(e.data.id)?.(e.data.xy); F.waits.delete(e.data.id); };
+      F.w.onerror = () => { for (const done of F.waits.values()) done(null); F.waits.clear(); F.w = 'off'; };
+    }
+    if (F.w === 'off') throw new Error('no worker');
+    const id = ++F.seq;
+    const nodes = seed.nodes.map(({ id: n, r, hx, hy, x, y }) => ({ id: n, r, hx, hy, x, y }));
+    F.w.postMessage({ id, nodes, links: seed.sim, G: seed.G, budget: 4000 });
+    return new Promise((resolve) => F.waits.set(id, resolve));
+  } catch {
+    return Promise.resolve(null);
+  }
 }
 
 function layLayers(T) {
@@ -677,7 +715,8 @@ function layLayers(T) {
 // ───────────────────────────── Renderer ─────────────────────────────
 
 const R = { pitch: 0, yaw: 0, pivot: [0, 0, 0] };
-const reduced = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+const reducedQuery = matchMedia('(prefers-reduced-motion: reduce)');
+const reduced = () => reducedQuery.matches;
 
 const TILE_VERT = `
 attribute vec4 iRect;
@@ -740,9 +779,9 @@ void main() {
 const city = makeCity({
   state, R, d3, S, get theme() { return theme(); }, rgb, mix, css, clamp, paintOf, colorOf, classOf, classCtx, makeLit, detailRank, idOf, node,
   liftTo, isUnder, walk, pathOf, selIds, requestDraw: () => requestDraw(), inkCode: (...a) => inkCode(...a), wantText: (k) => wantText(k), wantSites: (k) => wantSites(k),
-  textWidth: (...a) => textWidth(...a), fitText: (...a) => fitText(...a), haloText: (...a) => haloText(...a), affine: (...a) => affine(...a), toScreen: (...a) => toScreen(...a),
+  textWidth: (...a) => textWidth(...a), fitText: (...a) => fitText(...a), fontSize: (...a) => fontSize(...a), haloText: (...a) => haloText(...a), affine: (...a) => affine(...a), toScreen: (...a) => toScreen(...a),
   viewport: () => viewport(), stageOf: (id) => stageOf(id), LEVEL_COLOR, LEVELS, LEVEL_RANK, STATUS, CODE, UI_FONT, MONO_FONT,
-  fitBox: (...a) => fitBox(...a), relink: () => buildLinks(), inkGrip: (ctx) => inkGrip(ctx),
+  fitBox: (...a) => fitBox(...a), relink: () => buildLinks({ force: true }), inkGrip: (ctx) => inkGrip(ctx),
   setTransform: (x, y, k) => d3.select('#view').interrupt().call(zoom.transform, d3.zoomIdentity.translate(x, y).scale(k)),
 });
 
@@ -770,8 +809,21 @@ function setupGL() {
   const links = new THREE.Group();
   links.renderOrder = 5;
   base.add(links);
-  Object.assign(R, { renderer, scene, camera, view, tilt, base, quad, tiles, tileMat, links, lineMats: new Map(), cap: 0, raycaster: new THREE.Raycaster() });
+  const linkLayers = {};
+  ['base', 'set', 'hover'].forEach((name, i) => { const group = new THREE.Group(); links.add(group); linkLayers[name] = { group, order: 5 + i, sig: null, list: [], cache: new Map(), keep: [3, 0, 12][i] }; });
+  Object.assign(R, { renderer, scene, camera, view, tilt, base, quad, tiles, tileMat, links, linkLayers, lineMats: new Map(), cap: 0, raycaster: new THREE.Raycaster() });
   city.attach();
+  // Compile every shader now (City's and the links' too, though hidden), so
+  // the first switch to a layout never stalls on a compile.
+  const warm = new LineSegments2(new LineSegmentsGeometry(), lineMat(LINK_WIDTH.call));
+  links.add(warm);
+  // A program's first use checks its compile log, which waits for the GPU to
+  // finish everything queued; do that here too, while the queue is empty.
+  renderer.compileAsync(scene, camera).catch(() => {}).finally(() => {
+    links.remove(warm);
+    warm.geometry.dispose();
+    for (const p of renderer.info.programs ?? []) p.getUniforms?.();
+  });
 }
 
 function sizeGL() {
@@ -804,8 +856,15 @@ function ensureTiles(n) {
 
 const MODE = { dir: 0, head: 0, body: 1, sym: 2, node: 0, ghost: 3, gdir: 4 };
 
-// Write item colors to the GPU (also used after paint, selection, or find changes).
+// Ask for item colors to be written to the GPU on the next frame (after
+// paint, selection, or find changes). Several asks in one frame cost one pass.
 function colorItems() {
+  R.recolor = true;
+  requestDraw();
+}
+
+function flushColors() {
+  R.recolor = false;
   const lay = state.lay;
   if (!lay) return;
   if (lay.kind === 'city') { city.color(); return; }
@@ -814,18 +873,28 @@ function colorItems() {
   const bg = rgb(th.bg);
   const col = R.quad.getAttribute('iColor').array;
   const sty = R.quad.getAttribute('iStyle').array;
-  const ctx = classCtx();
-  lay.items.forEach((it, i) => {
-    let c;
-    if (it.id < 0) c = it.ghost === 'gone' ? rgb(STATUS.critical) : it.ghost === 'new' ? rgb(STATUS.good) : rgb(th.neutral);
-    else c = colorOf(classOf(it.id, state.paint, ctx), it.id);
-    if (it.part === 'head') c = mix(c, [1, 1, 1], 0.08);
-    if (it.part === 'node' && it.loop) c = mix(c, rgb(STATUS.critical), 0.25);
-    if (lit && it.id > 0 && !lit(it.id)) c = mix(c, bg, it.part === 'dir' ? 0.45 : 0.8);
-    col.set([c[0], c[1], c[2], 1], i * 4);
-    const lh = it.part === 'body' || it.part === 'sym' ? lay.code?.get(state.T.fileOf[it.id])?.lh ?? 0 : 0;
-    sty.set([it.r ?? 2, MODE[it.part] ?? 0, lh, 0], i * 4);
-  });
+  const ghost = { gone: rgb(STATUS.critical), new: rgb(STATUS.good) };
+  const loopC = rgb(STATUS.critical);
+  const fileOf = state.T.fileOf;
+  let litId = -2, litOn = true;
+  for (let i = 0, n = lay.items.length; i < n; i++) {
+    const it = lay.items[i];
+    const id = it.id;
+    let r, g, b;
+    if (id < 0) { const c = ghost[it.ghost] ?? rgb(th.neutral); r = c[0]; g = c[1]; b = c[2]; }
+    else { const a = paintRgb(id); r = a[id * 3]; g = a[id * 3 + 1]; b = a[id * 3 + 2]; }
+    if (it.part === 'head') { r += (1 - r) * 0.08; g += (1 - g) * 0.08; b += (1 - b) * 0.08; }
+    if (it.loop) { r += (loopC[0] - r) * 0.25; g += (loopC[1] - g) * 0.25; b += (loopC[2] - b) * 0.25; }
+    if (lit && id > 0) {
+      if (id !== litId) { litId = id; litOn = lit(id); }
+      if (!litOn) { const t = it.part === 'dir' ? 0.45 : 0.8; r += (bg[0] - r) * t; g += (bg[1] - g) * t; b += (bg[2] - b) * t; }
+    }
+    const o = i * 4;
+    col[o] = r; col[o + 1] = g; col[o + 2] = b; col[o + 3] = 1;
+    sty[o] = it.r ?? 2; sty[o + 1] = MODE[it.part] ?? 0;
+    sty[o + 2] = it.part === 'body' || it.part === 'sym' ? lay.code?.get(fileOf[id])?.lh ?? 0 : 0;
+    sty[o + 3] = 0;
+  }
   R.quad.getAttribute('iColor').needsUpdate = true;
   R.quad.getAttribute('iStyle').needsUpdate = true;
 }
@@ -837,12 +906,14 @@ function placeItems(t) {
   const morph = R.morph;
   const e = morph ? d3.easeCubicInOut(t) : 1;
   const arr = R.quad.getAttribute('iRect').array;
-  lay.items.forEach((it, i) => {
+  const from = morph?.from;
+  for (let i = 0, n = lay.items.length; i < n; i++) {
+    const it = lay.items[i];
     let x = it.x, y = it.y, w = it.w, hh = it.h;
-    const f = morph?.from?.[i];
+    const f = from?.[i];
     if (f) { x = f[0] + (x - f[0]) * e; y = f[1] + (y - f[1]) * e; w = f[2] + (w - f[2]) * e; hh = f[3] + (hh - f[3]) * e; }
     arr[i * 4] = x; arr[i * 4 + 1] = -(y + hh); arr[i * 4 + 2] = w; arr[i * 4 + 3] = hh;
-  });
+  }
   R.quad.getAttribute('iRect').needsUpdate = true;
   R.quad.instanceCount = lay.items.length;
 }
@@ -850,6 +921,7 @@ function placeItems(t) {
 // The camera's resting angles: where a running morph or turn will end.
 const camAngles = () => ({ pitch: R.morph?.toPitch ?? R.cam?.to.pitch ?? R.pitch, yaw: R.morph?.toYaw ?? R.cam?.to.yaw ?? R.yaw });
 
+useLayout.uid = 0;
 function useLayout(next, { animate = true, fit = false } = {}) {
   const prev = state.lay;
   const isCity = next.kind === 'city';
@@ -871,6 +943,7 @@ function useLayout(next, { animate = true, fit = false } = {}) {
     });
   }
   const switched = prev?.kind !== next.kind;
+  next.uid ??= ++useLayout.uid;
   state.lay = next;
   R.tiles.visible = !isCity;
   if (isCity) city.use(next, prev, motion); else city.hide();
@@ -890,26 +963,58 @@ function useLayout(next, { animate = true, fit = false } = {}) {
   placeItems(R.morph ? 0 : 1);
   setZoomRange();
   if (fit) fitAll(motion ? 720 : 0);
-  buildLinks();
+  // Links hide while a layout morphs; they are built when it ends.
+  if (!R.morph) buildLinks();
   requestDraw();
 }
 
+// Graph and Layers are kept per Detail until the Map changes, so switching
+// back is instant. A large Graph lays out in a worker while the view stays live.
 function relayout(opts = {}) {
   const T = state.T;
   if (!T) return;
   const map = state.mapLay ?? (state.mapLay = layMap(T));
-  let next;
-  if (state.layout === 'graph') next = layGraph(T, map);
-  else if (state.layout === 'layers') next = layLayers(T);
+  const job = ++relayout.job;
+  if (state.flat?.map !== map) state.flat = { map, list: new Map() };
+  const kept = state.flat.list;
+  const key = `${state.layout}|${detailRank()}`;
+  let next = kept.get(key);
+  if (next) { /* kept */ }
+  else if (state.layout === 'graph') {
+    const seed = graphSeed(T, map);
+    if (seed.nodes.length > 400) {
+      R.laying = true;
+      drawStatus();
+      const flat = state.flat;
+      simulateOff(seed).then((xy) => {
+        if (xy) seed.nodes.forEach((n, i) => { n.x = xy[i * 2]; n.y = xy[i * 2 + 1]; });
+        else simulate(d3, seed.nodes, seed.sim, seed.G);
+        flat.list.set(key, graphOf(T, seed));
+        if (job !== relayout.job) return;
+        R.laying = false;
+        drawStatus();
+        relayout(opts);
+      });
+      return;
+    }
+    simulate(d3, seed.nodes, seed.sim, seed.G);
+    kept.set(key, (next = graphOf(T, seed)));
+  } else if (state.layout === 'layers') kept.set(key, (next = layLayers(T)));
   else if (state.layout === 'city') next = city.lay(T, map);
   else next = map;
+  if (R.laying) { R.laying = false; drawStatus(); }
   useLayout(next, opts);
 }
+relayout.job = 0;
 
 // ───────────────────────────── Links ─────────────────────────────
+// Links draw in three layers, each rebuilt only when its inputs change: the
+// base (every link in All, or the dim backdrop of Graph and Layers in Focus),
+// the set (its boundary and picked links), and the hover. Routes are cached per
+// layout, so hovering and selecting never re-route the base.
 
 function focusIds() {
-  const ids = selIds();
+  const ids = [...selIds()];
   if (state.hover > 0 && !ids.includes(state.hover)) ids.push(state.hover);
   return ids;
 }
@@ -977,15 +1082,8 @@ function siteLines(li) {
   return sites.out.filter((x) => x.from === from && x.to === to && x.kind === kind).map((x) => x.line);
 }
 
-function linkSet() {
-  const T = state.T;
-  const m = state.model;
-  const lay = state.lay;
-  if (!T || !lay) return [];
-  const rank = detailRank();
-  const flat = lay.kind === 'graph' || lay.kind === 'layers';
-  const visible = (id) => (flat ? lay.rect.has(id) : true);
-  const end = (id) => endOf(id, rank);
+// The merged link list of one layer, built with put(a, b, kind, w, dir, extra).
+function merger(visible) {
   const merged = new Map();
   const put = (a, b, kind, w, dir, extra) => {
     if (a === b || a <= 0 || b <= 0 || !visible(a) || !visible(b)) return;
@@ -995,16 +1093,43 @@ function linkSet() {
     e.w += w;
     e.kinds.add(kind);
   };
+  return { merged, put };
+}
+
+const linkCtx = () => {
+  const lay = state.lay;
+  const flat = lay.kind === 'graph' || lay.kind === 'layers';
+  const rank = detailRank();
+  return { T: state.T, m: state.model, lay, rank, flat, visible: flat ? (id) => lay.rect.has(id) : () => true, end: (id) => endOf(id, rank) };
+};
+const heaviest = (map, cap) => [...map.values()].sort((p, q) => q.w - p.w).slice(0, cap);
+
+// Base layer: every link lifted to the Detail (All), or the dim backdrop of
+// Graph and Layers (Focus).
+function baseLinks() {
+  const { T, m, lay, rank, flat, visible } = linkCtx();
+  const { merged, put } = merger(visible);
   if (state.links === 'focus' && flat) {
-    if (lay.dim?.rank !== rank) {
-      const dim = new Map();
-      for (const e of lay.links ?? []) dim.set(`${e.a},${e.b},dim`, { a: e.a, b: e.b, kind: 'dim', w: e.w, dir: 'dim', kinds: new Set(['dim']) });
-      lay.dim = { rank, list: dim };
-    }
-    for (const [key, e] of lay.dim.list) merged.set(key, { ...e });
+    for (const e of lay.links ?? []) put(e.a, e.b, 'dim', e.w, 'dim');
+    return heaviest(merged, 6000);
   }
+  if (state.links !== 'all') return [];
+  const kinds = m.linkKinds.map(kindOn);
+  for (const [s, t, k, w] of m.links) {
+    if (!kinds[k]) continue;
+    const a = liftTo(s, rank), b = liftTo(t, rank);
+    if (isUnder(a, b) || isUnder(b, a)) continue;
+    put(a, b, m.linkKinds[k], w);
+  }
+  return heaviest(merged, 4000);
+}
+
+// Set layer: the set's boundary (Focus) and its link members. At reading zoom,
+// link members leave from the exact lines where they happen.
+function setLinks() {
+  const { T, m, rank, flat, visible, end } = linkCtx();
+  const { merged, put } = merger(visible);
   if (state.links === 'focus') {
-    // The set's boundary: links inside it, what it uses, and what uses it.
     const members = selIds();
     const memberSet = new Set(members);
     const memberOf = (id) => { for (let p = id; p >= 0; p = T.N[p].up) if (memberSet.has(p)) return p; return -1; };
@@ -1027,40 +1152,7 @@ function linkSet() {
         }
       }, 6000);
     }
-    const site = state.hoverSite;
-    if (site) {
-      // A hovered code line shows only that line's links, from the line itself.
-      const sites = state.sites.get(T.N[site.file].key);
-      const at = siteAnchor(site.file, site.line);
-      for (const x of sites?.out ?? []) {
-        if (x.line !== site.line) continue;
-        const s = idOf(x.from), t = idOf(x.to);
-        if (s >= 0 && t >= 0 && kindOn(x.kind)) put(s, end(t), x.kind, 1, 'out', { pa: at, tag: '@' + site.line });
-      }
-      for (const x of sites?.in ?? []) {
-        const t = idOf(x.to), s = idOf(x.from);
-        if (t < 0 || s < 0 || T.N[t].from !== site.line || T.fileOf[t] !== site.file || !kindOn(x.kind)) continue;
-        put(end(s), t, x.kind, 1, 'in', { pb: at, tag: '@' + site.line });
-      }
-    } else if (state.hover > 0 && !memberSet.has(state.hover)) {
-      const f = state.hover;
-      const self = flat ? liftTo(f, rank) : f;
-      walk(f, (id) => {
-        for (const li of T.out[id]) { const [, t, k, w] = m.links[li]; const kind = m.linkKinds[k]; if (kindOn(kind) && !isUnder(t, f)) put(self, end(t), kind, w, 'out'); }
-        for (const li of T.inn[id]) { const [src, , k, w] = m.links[li]; const kind = m.linkKinds[k]; if (kindOn(kind) && !isUnder(src, f)) put(end(src), self, kind, w, 'in'); }
-      }, 6000);
-    }
-  } else if (state.links === 'all') {
-    for (const [s, t, k, w] of m.links) {
-      const kind = m.linkKinds[k];
-      if (!kindOn(kind)) continue;
-      const a = liftTo(s, rank), b = liftTo(t, rank);
-      if (isUnder(a, b) || isUnder(b, a)) continue;
-      put(a, b, kind, w);
-    }
   }
-  // Link members of the set always show. At reading zoom they leave from the
-  // exact lines where they happen.
   for (const l of state.set.links) {
     for (const li of S.linkIndices(T.I, l, 400)) {
       const [s, t, k, w] = m.links[li];
@@ -1071,10 +1163,38 @@ function linkSet() {
       else put(end(s), end(t), kind, w, 'pick', { member: l });
     }
   }
-  const list = [...merged.values()];
-  const dim = list.filter((e) => e.dir === 'dim'), bright = list.filter((e) => e.dir !== 'dim');
-  const lit = new Set(bright.map((e) => `${e.a},${e.b}`));
-  return [...dim.filter((e) => !lit.has(`${e.a},${e.b}`) && !lit.has(`${e.b},${e.a}`)).sort((p, q) => q.w - p.w).slice(0, 6000), ...bright.sort((p, q) => q.w - p.w).slice(0, 4000)];
+  return heaviest(merged, 4000);
+}
+
+// Hover layer (Focus): a hovered code line's own links, from the line itself,
+// or a hovered part's links when it is not in the set.
+function hoverLinks() {
+  if (state.links !== 'focus') return [];
+  const { T, m, rank, flat, visible, end } = linkCtx();
+  const { merged, put } = merger(visible);
+  const site = state.hoverSite;
+  if (site) {
+    const sites = state.sites.get(T.N[site.file].key);
+    const at = siteAnchor(site.file, site.line);
+    for (const x of sites?.out ?? []) {
+      if (x.line !== site.line) continue;
+      const s = idOf(x.from), t = idOf(x.to);
+      if (s >= 0 && t >= 0 && kindOn(x.kind)) put(s, end(t), x.kind, 1, 'out', { pa: at, tag: '@' + site.line });
+    }
+    for (const x of sites?.in ?? []) {
+      const t = idOf(x.to), s = idOf(x.from);
+      if (t < 0 || s < 0 || T.N[t].from !== site.line || T.fileOf[t] !== site.file || !kindOn(x.kind)) continue;
+      put(end(s), t, x.kind, 1, 'in', { pb: at, tag: '@' + site.line });
+    }
+  } else if (state.hover > 0 && !selIds().includes(state.hover)) {
+    const f = state.hover;
+    const self = flat ? liftTo(f, rank) : f;
+    walk(f, (id) => {
+      for (const li of T.out[id]) { const [, t, k, w] = m.links[li]; const kind = m.linkKinds[k]; if (kindOn(kind) && !isUnder(t, f)) put(self, end(t), kind, w, 'out'); }
+      for (const li of T.inn[id]) { const [src, , k, w] = m.links[li]; const kind = m.linkKinds[k]; if (kindOn(kind) && !isUnder(src, f)) put(end(src), self, kind, w, 'in'); }
+    }, 6000);
+  }
+  return heaviest(merged, 800);
 }
 
 // Sample a d3 curve into points by drawing it into a recording context.
@@ -1097,9 +1217,28 @@ function sampleCurve(points, curve, steps = 6) {
   return out;
 }
 
+// Points as a flat xyz array.
+function flatPts(pts) {
+  const out = new Float32Array(pts.length * 3);
+  pts.forEach((p, i) => { out[i * 3] = p[0]; out[i * 3 + 1] = p[1]; out[i * 3 + 2] = p[2] ?? 0; });
+  return out;
+}
+
+// A link's path in layout units (flat xyz). Routes between parts are cached
+// per layout; City routes follow open buildings, so City asks every time.
 function routeOf(e) {
   const lay = state.lay;
-  if (lay.kind === 'city') return city.route(e);
+  if (lay.kind === 'city') { const pts = city.route(e); return pts ? flatPts(pts) : null; }
+  const cache = !e.pa && !e.pb ? (lay.routes ??= new Map()) : null;
+  const key = cache && `${e.a}>${e.b}`;
+  if (cache?.has(key)) return cache.get(key);
+  const pts = routeOf2d(e, lay);
+  const out = pts ? flatPts(pts) : null;
+  cache?.set(key, out);
+  return out;
+}
+
+function routeOf2d(e, lay) {
   const a = e.pa ?? anchorOf(e.a), b = e.pb ?? anchorOf(e.b);
   if (!a || !b) return null;
   if (lay.kind === 'map') {
@@ -1108,13 +1247,13 @@ function routeOf(e) {
     while (i < pa.length && i < pb.length && pa[i] === pb[i]) i++;
     const via = [...pa.slice(Math.max(i - 1, 0), -1).reverse(), ...pb.slice(Math.max(i - 1, 0), -1)].map(anchorOf).filter(Boolean);
     const pts = [a, ...via.slice(0, 8), b];
-    return pts.length > 2 ? sampleCurve(pts, d3.curveBundle.beta(0.82), 5).map((p) => [p[0], p[1], 0]) : [[...a, 0], [...b, 0]];
+    return pts.length > 2 ? sampleCurve(pts, d3.curveBundle.beta(0.82), 5) : [a, b];
   }
   if (lay.kind === 'layers') {
     const ra = lay.rect.get(e.a), rb = lay.rect.get(e.b);
     if (Math.abs(ra.y - rb.y) < 1) {
       const lift = 14 + Math.abs(a[0] - b[0]) * 0.08;
-      return sampleCurve([[a[0], ra.y], [(a[0] + b[0]) / 2, ra.y - lift], [b[0], rb.y]], d3.curveNatural, 6).map((p) => [p[0], p[1], 0]);
+      return sampleCurve([[a[0], ra.y], [(a[0] + b[0]) / 2, ra.y - lift], [b[0], rb.y]], d3.curveNatural, 6);
     }
     const down = ra.y < rb.y;
     const y0 = down ? ra.y + ra.h : ra.y, y1 = down ? rb.y : rb.y + rb.h;
@@ -1122,7 +1261,7 @@ function routeOf(e) {
     for (let i = 0; i <= 14; i++) {
       const t = i / 14, u = 1 - t;
       const my = (y0 + y1) / 2;
-      out.push([u * u * u * a[0] + 3 * u * u * t * a[0] + 3 * u * t * t * b[0] + t * t * t * b[0], u * u * u * y0 + 3 * u * u * t * my + 3 * u * t * t * my + t * t * t * y1, 0]);
+      out.push([u * u * u * a[0] + 3 * u * u * t * a[0] + 3 * u * t * t * b[0] + t * t * t * b[0], u * u * u * y0 + 3 * u * u * t * my + 3 * u * t * t * my + t * t * t * y1]);
     }
     return out;
   }
@@ -1131,7 +1270,7 @@ function routeOf(e) {
   const out = [];
   for (let i = 0; i <= 10; i++) {
     const t = i / 10, u = 1 - t;
-    out.push([u * u * a[0] + 2 * u * t * mx + t * t * b[0], u * u * a[1] + 2 * u * t * my + t * t * b[1], 0]);
+    out.push([u * u * a[0] + 2 * u * t * mx + t * t * b[0], u * u * a[1] + 2 * u * t * my + t * t * b[1]]);
   }
   return out;
 }
@@ -1157,77 +1296,166 @@ function lineMat(width) {
   return m;
 }
 
-function buildLinks() {
-  const th = theme();
-  const list = state.lay ? linkSet() : [];
-  state.linkList = list;
-  state.linkVer = (state.linkVer ?? 0) + 1;
-  state.hoverLink = null;
+// Route a layer's links, note where each arrowhead goes (92% along), and
+// build its GPU lines: one mesh per line width, colors fading in toward the
+// target.
+function drawLayer(layer, list, maxW) {
+  const bg = rgb(theme().bg);
   const groups = new Map();
-  const bg = rgb(th.bg);
-  const maxW = d3.max(list, (e) => e.w) ?? 1;
   for (const e of list) {
-    const pts = routeOf(e);
-    e.pts = pts;
-    if (!pts) continue;
+    const p = routeOf(e);
+    e.pts = p;
+    if (!p || p.length < 6) continue;
     const st = linkStyle(e, maxW);
     e.color = st.color;
-    let g = groups.get(st.width);
-    if (!g) groups.set(st.width, (g = { pos: [], col: [] }));
-    for (let i = 1; i < pts.length; i++) {
-      const p = pts[i - 1], q = pts[i];
-      g.pos.push(p[0], -p[1], p[2], q[0], -q[1], q[2]);
-      const c0 = mix(bg, st.color, (0.25 + 0.75 * ((i - 1) / (pts.length - 1))) * st.strength);
-      const c1 = mix(bg, st.color, (0.25 + 0.75 * (i / (pts.length - 1))) * st.strength);
-      g.col.push(...c0, ...c1);
+    e.fill = null;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, len = 0;
+    const n = p.length / 3;
+    for (let i = 0; i < n; i++) {
+      const x = p[i * 3], y = p[i * 3 + 1];
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      if (i) len += Math.hypot(x - p[i * 3 - 3], y - p[i * 3 - 2], p[i * 3 + 2] - p[i * 3 - 1]);
     }
+    e.box = [x0, y0, x1, y1];
+    e.len = len;
+    e.arrow = null;
+    if (e.dir !== 'dim' && !(e.kind === 'change' && e.kinds.size === 1) && len > 0) {
+      let goal = len * 0.92, i = 1;
+      for (; i < n; i++) {
+        const seg = Math.hypot(p[i * 3] - p[i * 3 - 3], p[i * 3 + 1] - p[i * 3 - 2], p[i * 3 + 2] - p[i * 3 - 1]);
+        if (goal <= seg || i === n - 1) {
+          const t = seg ? Math.min(1, goal / seg) : 0;
+          const d = [p[i * 3] - p[i * 3 - 3], p[i * 3 + 1] - p[i * 3 - 2], p[i * 3 + 2] - p[i * 3 - 1]];
+          e.arrow = [p[i * 3 - 3] + d[0] * t, p[i * 3 - 2] + d[1] * t, p[i * 3 - 1] + d[2] * t, d[0], d[1], d[2]];
+          break;
+        }
+        goal -= seg;
+      }
+    }
+    let g = groups.get(st.width);
+    if (!g) groups.set(st.width, (g = { list: [], segs: 0 }));
+    g.list.push([e, st]);
+    g.segs += n - 1;
   }
-  for (const old of [...R.links.children]) { R.links.remove(old); old.geometry.dispose(); }
   const depth = state.lay?.kind === 'city';
   for (const [width, g] of groups) {
-    if (!g.pos.length) continue;
+    if (!g.segs) continue;
+    const pos = new Float32Array(g.segs * 6), col = new Float32Array(g.segs * 6);
+    let o = 0;
+    for (const [e, st] of g.list) {
+      const p = e.pts, n = p.length / 3, c = st.color;
+      for (let i = 1; i < n; i++) {
+        pos[o] = p[i * 3 - 3]; pos[o + 1] = -p[i * 3 - 2]; pos[o + 2] = p[i * 3 - 1];
+        pos[o + 3] = p[i * 3]; pos[o + 4] = -p[i * 3 + 1]; pos[o + 5] = p[i * 3 + 2];
+        const t0 = (0.25 + 0.75 * ((i - 1) / (n - 1))) * st.strength, t1 = (0.25 + 0.75 * (i / (n - 1))) * st.strength;
+        for (let j = 0; j < 3; j++) { col[o + j] = bg[j] + (c[j] - bg[j]) * t0; col[o + 3 + j] = bg[j] + (c[j] - bg[j]) * t1; }
+        o += 6;
+      }
+    }
     const geo = new LineSegmentsGeometry();
-    geo.setPositions(g.pos);
-    geo.setColors(g.col);
+    geo.setPositions(pos);
+    geo.setColors(col);
     const mat = lineMat(width);
     mat.depthTest = depth;
     const lines = new LineSegments2(geo, mat);
     lines.frustumCulled = false;
-    lines.renderOrder = 5;
-    R.links.add(lines);
+    lines.renderOrder = layer.order;
+    layer.group.add(lines);
   }
+  layer.list = list;
 }
 
-// Bright links projected to the screen, cached while the view stays put.
-// Used for arrowheads and for picking links.
-function linkScreens() {
-  const t = state.t;
-  const sig = `${t.k},${t.x},${t.y},${R.pitch},${R.yaw},${R.pivot},${state.linkVer},${R.W},${R.H}`;
-  if (R.linkScreens?.sig === sig) return R.linkScreens.list;
-  const A = affine();
-  const list = [];
-  for (const e of state.linkList ?? []) {
-    if (!e.pts || e.dir === 'dim') continue;
-    const xy = new Float32Array(e.pts.length * 2);
-    e.pts.forEach((p, i) => { xy[i * 2] = A.O[0] + p[0] * A.u[0] + p[1] * A.v[0] + p[2] * A.w[0]; xy[i * 2 + 1] = A.O[1] + p[0] * A.u[1] + p[1] * A.v[1] + p[2] * A.w[1]; });
-    list.push({ e, xy });
+// Rebuild the link layers whose inputs changed (all of them with `force`,
+// which City uses when buildings open or close).
+function buildLinks({ force = false } = {}) {
+  const L = R.linkLayers;
+  if (!L) return;
+  const lay = state.lay;
+  const live = !!lay && !!state.T;
+  const base = live ? `${lay.uid}|${state.T.uid}|${detailRank()}|${state.links}|${JSON.stringify(state.kinds)}|${theme().bg}` : '';
+  const pickSig = live ? state.set.links.slice(0, 50).map((l) => { const a = idOf(l[0]); const f = a >= 0 ? state.T.fileOf[a] : -1; return f >= 0 && readable(f) ? 1 : 0; }).join('') : '';
+  const sigs = {
+    base,
+    set: live ? `${base}|${state.setVer}|${pickSig}|${state.set.links.length ? state.sitesVer ?? 0 : ''}` : '',
+    hover: live && state.links === 'focus' ? `${base}|${state.setVer}|${state.hover}|${state.hoverSite ? `${state.hoverSite.file}:${state.hoverSite.line}|${state.sitesVer ?? 0}` : ''}` : '',
+  };
+  let changed = false;
+  let maxW = 1;
+  for (const name of ['base', 'set', 'hover']) {
+    const layer = L[name];
+    if (force) dropCache(layer);
+    if (!force && layer.sig === sigs[name]) { if (name !== 'base') maxW = Math.max(maxW, d3.max(layer.list, (e) => e.w) ?? 1); continue; }
+    // Recent base and hover layers are kept, so going back to one is instant.
+    if (layer.keep && layer.sig && !force) layer.cache.set(layer.sig, { meshes: [...layer.group.children], list: layer.list, maxW: layer.maxW });
+    else for (const m of layer.group.children) m.geometry.dispose();
+    layer.group.clear();
+    while (layer.cache.size > layer.keep) { const [k, v] = layer.cache.entries().next().value; layer.cache.delete(k); for (const m of v.meshes) m.geometry.dispose(); }
+    const hit = !force && layer.cache.get(sigs[name]);
+    if (hit) {
+      layer.cache.delete(sigs[name]);
+      for (const m of hit.meshes) layer.group.add(m);
+      layer.list = hit.list;
+      layer.maxW = hit.maxW;
+    } else {
+      const list = !live ? [] : name === 'base' ? baseLinks() : name === 'set' ? setLinks() : hoverLinks();
+      const w = d3.max(list, (e) => e.w) ?? 1;
+      layer.maxW = name === 'base' ? w : Math.max(maxW, w);
+      drawLayer(layer, list, layer.maxW);
+    }
+    if (name !== 'base') maxW = Math.max(maxW, layer.maxW);
+    layer.sig = sigs[name];
+    changed = true;
   }
-  R.linkScreens = { sig, list };
-  return list;
+  if (!changed) return;
+  state.linkList = [...L.base.list, ...L.set.list, ...L.hover.list];
+  // Arrowheads: the heaviest bright links first.
+  state.arrows = state.linkList.filter((e) => e.arrow).sort((p, q) => q.w - p.w);
+  state.linkVer = (state.linkVer ?? 0) + 1;
+  state.hoverLink = null;
 }
 
-// The drawn link nearest a screen point, within `tol` pixels.
+function dropCache(layer) {
+  for (const v of layer.cache.values()) for (const m of v.meshes) m.geometry.dispose();
+  layer.cache.clear();
+}
+
+// A link's points on the screen, as a flat xy array.
+function linkScreen(e, A = affine()) {
+  const p = e.pts, n = p.length / 3;
+  const xy = new Float32Array(n * 2);
+  for (let i = 0; i < n; i++) {
+    const x = p[i * 3], y = p[i * 3 + 1], z = p[i * 3 + 2];
+    xy[i * 2] = A.O[0] + x * A.u[0] + y * A.v[0] + z * A.w[0];
+    xy[i * 2 + 1] = A.O[1] + x * A.u[1] + y * A.v[1] + z * A.w[1];
+  }
+  return xy;
+}
+
+// The drawn link nearest a screen point, within `tol` pixels. Flat views skip
+// links whose box is far from the point.
 function pickLink(sx, sy, tol = 5) {
   if (R.morph) return null;
+  const A = affine();
+  const flat = !R.pitch && !R.yaw;
+  const [wx, wy] = flat ? toWorld(sx, sy) : [0, 0];
+  const pad = tol / state.t.k;
   let best = null, bestD = tol;
-  for (const { e, xy } of linkScreens()) {
-    for (let i = 2; i < xy.length; i += 2) {
-      const ax = xy[i - 2], ay = xy[i - 1], bx = xy[i], by = xy[i + 1];
-      const dx = bx - ax, dy = by - ay;
-      const len = dx * dx + dy * dy;
-      const t = len ? clamp(((sx - ax) * dx + (sy - ay) * dy) / len, 0, 1) : 0;
-      const d = Math.hypot(sx - ax - dx * t, sy - ay - dy * t);
-      if (d < bestD) { bestD = d; best = e; }
+  for (const e of state.linkList ?? []) {
+    if (!e.pts || e.dir === 'dim') continue;
+    if (flat && (wx < e.box[0] - pad || wx > e.box[2] + pad || wy < e.box[1] - pad || wy > e.box[3] + pad)) continue;
+    const p = e.pts, n = p.length / 3;
+    let ax = 0, ay = 0;
+    for (let i = 0; i < n; i++) {
+      const x = p[i * 3], y = p[i * 3 + 1], z = p[i * 3 + 2];
+      const bx = A.O[0] + x * A.u[0] + y * A.v[0] + z * A.w[0], by = A.O[1] + x * A.u[1] + y * A.v[1] + z * A.w[1];
+      if (i) {
+        const dx = bx - ax, dy = by - ay;
+        const len = dx * dx + dy * dy;
+        const t = len ? clamp(((sx - ax) * dx + (sy - ay) * dy) / len, 0, 1) : 0;
+        const d = Math.hypot(sx - ax - dx * t, sy - ay - dy * t);
+        if (d < bestD) { bestD = d; best = e; }
+      }
+      ax = bx; ay = by;
     }
   }
   return best;
@@ -1271,6 +1499,7 @@ function drawFrame(now) {
     R.yaw = R.cam.from.yaw + (R.cam.to.yaw - R.cam.from.yaw) * e;
     if (p >= 1) { R.cam = null; city.viewChanged(true); } else busy = true;
   }
+  if (R.recolor) flushColors();
   if (state.lay?.kind === 'city' && city.frame(now)) busy = true;
   R.renderer.setClearColor(th.bg, 1);
   R.tileMat.uniforms.uBg.value.set(th.bg);
@@ -1280,7 +1509,7 @@ function drawFrame(now) {
   R.tilt.position.set(R.pivot[0], -R.pivot[1], R.pivot[2]);
   R.base.position.set(-R.pivot[0], R.pivot[1], -R.pivot[2]);
   R.tilt.rotation.set(-R.pitch, 0, R.yaw);
-  R.links.visible = !R.morph && R.links.children.length > 0;
+  R.links.visible = !R.morph;
   const quiet = readingCode();
   for (const m of R.lineMats.values()) m.opacity = quiet ? 0.3 : 0.85;
   R.renderer.render(R.scene, R.camera);
@@ -1329,23 +1558,36 @@ function toScreen(x, y, z = 0) {
 
 // ───────────────────────────── Ink (text and outlines) ─────────────────────────────
 
+// Label sizes snap to half pixels, so measured widths are reused from frame
+// to frame while zooming.
+const fontSize = (px, lo = 0, hi = Infinity) => Math.round(clamp(px, lo, hi) * 2) / 2;
+
+// Text widths, cached per font and string.
 const widths = new Map();
+let widthCount = 0;
 function textWidth(ctx, s) {
-  const key = ctx.font + '|' + s;
-  let w = widths.get(key);
-  if (w == null) { w = ctx.measureText(s).width; if (widths.size > 40000) widths.clear(); widths.set(key, w); }
+  let byFont = widths.get(ctx.font);
+  if (!byFont) widths.set(ctx.font, (byFont = new Map()));
+  let w = byFont.get(s);
+  if (w == null) {
+    w = ctx.measureText(s).width;
+    if (++widthCount > 60000) { widths.clear(); widthCount = 0; widths.set(ctx.font, byFont = new Map()); }
+    byFont.set(s, w);
+  }
   return w;
 }
 
+// The longest prefix of `s` (with …) that fits in `max` pixels. Starts from a
+// guess by average glyph width, then steps, so it measures a few times at most.
 function fitText(ctx, s, max) {
   if (max <= 6) return '';
-  if (textWidth(ctx, s) <= max) return s;
-  let lo = 0, hi = s.length;
-  while (lo < hi) {
-    const mid = (lo + hi + 1) >> 1;
-    if (textWidth(ctx, s.slice(0, mid) + '…') <= max) lo = mid; else hi = mid - 1;
-  }
-  return lo ? s.slice(0, lo) + '…' : '';
+  const full = textWidth(ctx, s);
+  if (full <= max) return s;
+  const fits = (n) => textWidth(ctx, s.slice(0, n) + '…') <= max;
+  let n = Math.min(s.length - 1, Math.floor((s.length * max) / full));
+  if (fits(n)) { while (n + 1 < s.length && fits(n + 1)) n++; }
+  else { while (n > 0 && !fits(n - 1)) n--; n--; }
+  return n > 0 ? s.slice(0, n) + '…' : '';
 }
 
 let monoRatio = 0.6;
@@ -1392,10 +1634,10 @@ function inkMap(ctx) {
   const T = state.T, N = T.N, lay = state.lay;
   const { k, x: tx, y: ty } = state.t;
   const vx0 = -tx / k, vy0 = -ty / k, vx1 = (R.W - tx) / k, vy1 = (R.H - ty) / k;
-  const stack = [[0, false]];
+  const stack = [0], calmStack = [false];
   const files = [];
   while (stack.length) {
-    const [id, quiet] = stack.pop();
+    const id = stack.pop(), quiet = calmStack.pop();
     for (const c of T.kids[id]) {
       const n = N[c];
       if (RANK[n.kind] > 3) continue;
@@ -1404,11 +1646,11 @@ function inkMap(ctx) {
       const sw = r.w * k, sh = r.h * k;
       if (sw < 4 || sh < 4) continue;
       const sx = r.x * k + tx, sy = r.y * k + ty;
-      if (n.kind === 'file') { files.push([c, r, sx, sy, sw, sh, quiet]); continue; }
+      if (n.kind === 'file') { files.push(c, sx, sy, sw, sh, quiet); continue; }
       const hp = r.head * k;
       let calm = quiet;
       if (hp >= 8.5 && sw > 34) {
-        const size = clamp(hp * 0.62, 9.5, 22);
+        const size = fontSize(hp * 0.62, 9.5, 22);
         ctx.font = `${n.kind === 'repo' ? 650 : 560} ${size}px ${UI_FONT}`;
         const label = n.kind === 'repo' && n.branch ? `${n.name}  ·  ${n.branch}` : n.name;
         const lx = Math.max(sx + hp * 0.35, Math.min(8, sx + sw - 40));
@@ -1423,7 +1665,7 @@ function inkMap(ctx) {
           ctx.fillText(s, sx + sw - hp * 0.3 - textWidth(ctx, s), sy + hp * 0.52);
         }
       } else if (!quiet && sw > 56 && sh > 26 && !kidsReadable(c, k)) {
-        const size = clamp(Math.min(sh * 0.2, (sw / Math.max(4, n.name.length)) * 1.45), 10, 26);
+        const size = fontSize(Math.min(sh * 0.2, (sw / Math.max(4, n.name.length)) * 1.45), 10, 26);
         ctx.font = `620 ${size}px ${UI_FONT}`;
         const text = fitText(ctx, n.name, sw - 10);
         if (text) {
@@ -1432,10 +1674,11 @@ function inkMap(ctx) {
           calm = true;
         }
       }
-      stack.push([c, calm]);
+      stack.push(c);
+      calmStack.push(calm);
     }
   }
-  for (const f of files) inkFile(ctx, ...f);
+  for (let i = 0; i < files.length; i += 6) inkFile(ctx, files[i], lay.rect.get(files[i]), files[i + 1], files[i + 2], files[i + 3], files[i + 4], files[i + 5]);
   inkGhosts(ctx);
 }
 
@@ -1457,7 +1700,7 @@ function inkGhosts(ctx) {
     ctx.lineWidth = 1.5;
     ctx.strokeRect(sx + 0.75, sy + 0.75, sw - 1.5, sh - 1.5);
     if (sw > 50 && sh > 16) {
-      ctx.font = `600 ${clamp(sh * 0.2, 10, 13)}px ${UI_FONT}`;
+      ctx.font = `600 ${fontSize(sh * 0.2, 10, 13)}px ${UI_FONT}`;
       const label = fitText(ctx, `${g.ghost === 'gone' ? 'deleted' : 'new'} · ${g.name}`, sw - 10);
       if (label) haloText(ctx, label, sx + 6, sy + Math.min(sh / 2, 14), g.ghost === 'gone' ? STATUS.critical : STATUS.good, th);
     }
@@ -1493,17 +1736,15 @@ function inkFile(ctx, id, r, sx, sy, sw, sh, quiet) {
   const { k } = state.t;
   const hp = r.head * k;
   if (hp >= 9 && sw > 30) {
-    const size = clamp(hp * 0.6, 9.5, 17);
-    ctx.font = `600 ${size}px ${UI_FONT}`;
+    const size = fontSize(hp * 0.6, 9.5, 17);
     const right = sw > 120 ? short(n.lines) : '';
-    ctx.font = `500 ${size * 0.9}px ${UI_FONT}`;
+    ctx.font = `500 ${fontSize(size * 0.9)}px ${UI_FONT}`;
     const rw = right ? textWidth(ctx, right) + 8 : 0;
     ctx.fillStyle = css(rgb(th.bg), 0.62);
     if (right) ctx.fillText(right, sx + sw - rw - 2, sy + hp * 0.52);
     ctx.font = `600 ${size}px ${UI_FONT}`;
-    ctx.fillStyle = state.paint === 'lang' || state.paint === 'issues' || state.paint === 'review' || state.paint === 'stage' ? '#0d0d0c' : th.ink;
-    const lum = paintOf(id);
-    const dark = lum[0] * 0.3 + lum[1] * 0.59 + lum[2] * 0.11 > 0.55;
+    const pc = paintRgb(id);
+    const dark = pc[id * 3] * 0.3 + pc[id * 3 + 1] * 0.59 + pc[id * 3 + 2] * 0.11 > 0.55;
     ctx.fillStyle = dark ? '#111110' : '#f6f5f2';
     ctx.fillText(fitText(ctx, n.name, sw - hp * 0.5 - rw), sx + hp * 0.3, sy + hp * 0.52);
     const st = stageOf(id);
@@ -1514,7 +1755,7 @@ function inkFile(ctx, id, r, sx, sy, sw, sh, quiet) {
       ctx.fillText(s, sx + sw - rw - hp * 0.6 - 4, sy + hp * 0.52);
     }
   } else if (!quiet && sw > 64 && sh > 22 && (lay.code.get(id)?.lh ?? 0) * k < 1.6) {
-    const size = clamp(Math.min(sh * 0.24, (sw / Math.max(4, n.name.length)) * 1.5), 9.5, 17);
+    const size = fontSize(Math.min(sh * 0.24, (sw / Math.max(4, n.name.length)) * 1.5), 9.5, 17);
     ctx.font = `600 ${size}px ${UI_FONT}`;
     const text = fitText(ctx, n.name, sw - 8);
     if (text) haloText(ctx, text, sx + (sw - textWidth(ctx, text)) / 2, sy + sh / 2, th.ink, th);
@@ -1533,6 +1774,55 @@ function inkFile(ctx, id, r, sx, sy, sw, sh, quiet) {
 // transform set to that plane. Options: `only` (line indexes to draw, skips
 // screen culling), `vlh` (on-screen line height for the text threshold),
 // `mini` (force bars), `roof` (no symbol labels).
+// Per-file facts the code renderer reads every frame: the worst finding on
+// each line (per model and waived toggle), call-site marks (per loaded link
+// sites), and the set's symbols and ranges in the file (per set).
+const codeFacts = new Map();
+function factsOf(id, key, textMode) {
+  const T = state.T;
+  let f = codeFacts.get(id);
+  if (!f || f.T !== T) { f = { T }; if (codeFacts.size > 3000) codeFacts.clear(); codeFacts.set(id, f); }
+  if (f.waived !== state.showWaived || !f.marks) {
+    const marks = new Map();
+    walk(id, (x) => { for (const i of T.issuesOf[x]) { const iss = state.model.issues[i]; if (iss.waived && !state.showWaived) continue; const prev = marks.get(iss.line); if (!prev || LEVEL_RANK[iss.level] > LEVEL_RANK[prev]) marks.set(iss.line, iss.level); } });
+    f.marks = marks;
+    f.waived = state.showWaived;
+  }
+  if (f.set !== state.set) {
+    f.set = state.set;
+    f.picked = selIds().filter((s) => T.fileOf[s] === id && s !== id).map((s) => T.N[s]);
+    f.ranges = state.set.ranges.filter((r) => r[0] === key);
+  }
+  // Call sites: → on lines that link out, ←n on declarations others link to.
+  if (textMode) {
+    const sites = state.sites.get(key);
+    if (!sites) wantSites(key);
+    else if (f.sites !== sites) {
+      f.sites = sites;
+      f.outs = new Set(sites.out.filter((x) => x.kind !== 'copy').map((x) => x.line));
+      f.ins = new Map();
+      for (const x of sites.in) { const t = idOf(x.to); const line = t >= 0 ? T.N[t].from ?? 0 : 0; if (line && x.kind !== 'copy') f.ins.set(line, (f.ins.get(line) ?? 0) + 1); }
+    }
+  }
+  return f;
+}
+
+// Minimap bars, batched by token color: one fill per color per column.
+const bars = Array.from({ length: 8 }, () => []);
+function flushBars(ctx, tokens) {
+  ctx.globalAlpha = 0.62;
+  for (let cls = 0; cls < bars.length; cls++) {
+    const b = bars[cls];
+    if (!b.length) continue;
+    ctx.fillStyle = tokens[cls];
+    ctx.beginPath();
+    for (let i = 0; i < b.length; i += 4) ctx.rect(b[i], b[i + 1], b[i + 2], b[i + 3]);
+    ctx.fill();
+    b.length = 0;
+  }
+  ctx.globalAlpha = 1;
+}
+
 function inkCode(ctx, id, c, text, lhPx, quiet = false, view = state.t, opts = {}) {
   const th = theme();
   const T = state.T, lay = state.lay;
@@ -1542,25 +1832,13 @@ function inkCode(ctx, id, c, text, lhPx, quiet = false, view = state.t, opts = {
   const tokens = th.tokens;
   const textMode = !opts.mini && (opts.vlh ?? lhPx) >= 7.5;
   const fontPx = Math.min(lhPx * 0.84, cwPx / monoRatio);
-  const issues = T.issuesOf;
   const key = T.N[id].key;
-  const marks = new Map();
-  walk(id, (x) => { for (const i of issues[x]) { const iss = state.model.issues[i]; if (iss.waived && !state.showWaived) continue; const prev = marks.get(iss.line); if (!prev || LEVEL_RANK[iss.level] > LEVEL_RANK[prev]) marks.set(iss.line, iss.level); } });
-  const sel = selIds();
-  const picked = sel.filter((s) => T.fileOf[s] === id && s !== id).map((s) => T.N[s]);
-  const ranges = state.set.ranges.filter((r) => r[0] === key);
-  if (R.rangeDrag?.file === id) ranges.push([key, Math.min(R.rangeDrag.from, R.rangeDrag.to), Math.max(R.rangeDrag.from, R.rangeDrag.to)]);
-  // Call sites: → on lines that link out, ←n on declarations others link to.
-  let outs = null, ins = null;
-  if (textMode) {
-    const sites = state.sites.get(key);
-    if (!sites) wantSites(key);
-    else {
-      outs = new Set(sites.out.filter((x) => x.kind !== 'copy').map((x) => x.line));
-      ins = new Map();
-      for (const x of sites.in) { const t = idOf(x.to); const line = t >= 0 ? T.N[t].from ?? 0 : 0; if (line && x.kind !== 'copy') ins.set(line, (ins.get(line) ?? 0) + 1); }
-    }
-  }
+  const facts = factsOf(id, key, textMode);
+  const { marks, picked } = facts;
+  let ranges = facts.ranges;
+  if (R.rangeDrag?.file === id) ranges = [...ranges, [key, Math.min(R.rangeDrag.from, R.rangeDrag.to), Math.max(R.rangeDrag.from, R.rangeDrag.to)]];
+  const outs = textMode && facts.sites === state.sites.get(key) ? facts.outs : null;
+  const ins = outs ? facts.ins : null;
   const hoverHere = state.hover >= 0 && T.fileOf[state.hover] === id;
   for (let j = 0; j < c.cols; j++) {
     const colX = (c.x + j * (c.colW + c.gap)) * k + tx;
@@ -1625,18 +1903,17 @@ function inkCode(ctx, id, c, text, lhPx, quiet = false, view = state.t, opts = {
           if (inN) { ctx.fillStyle = th.series[1]; ctx.fillText(`←${inN}`, mx + (out ? cwPx * scale : 0), y + lhPx * 0.55); }
         }
       } else {
-        ctx.globalAlpha = 0.62;
+        const by = y + lhPx * 0.22, bh = Math.max(0.6, lhPx * 0.56);
         for (let s = 0; s < spans.length; s += 3) {
           const cls = spans[s + 2];
           if (cls === TK.pun && spans[s + 1] < 2) continue;
-          ctx.fillStyle = tokens[cls];
           const x = colX + gutPx + spans[s] * cwPx;
           if (x > colX + colW) break;
-          ctx.fillRect(x, y + lhPx * 0.22, Math.max(0.6, spans[s + 1] * cwPx - 0.4), Math.max(0.6, lhPx * 0.56));
+          bars[cls].push(x, by, Math.max(0.6, spans[s + 1] * cwPx - 0.4), bh);
         }
-        ctx.globalAlpha = 1;
       }
     }
+    if (!textMode) flushBars(ctx, tokens);
     ctx.restore();
   }
   if (!textMode && lhPx >= 1.6 && !quiet && !opts.roof) {
@@ -1697,9 +1974,16 @@ function inkGraph(ctx) {
   const take = (x, y, w, hgt) => {
     for (let gx = Math.floor(x / cell); gx <= Math.floor((x + w) / cell); gx++) for (let gy = Math.floor(y / cell); gy <= Math.floor((y + hgt) / cell); gy++) grid.add(gx * 4096 + gy);
   };
-  const focus = new Set(focusIds().map((id) => (lay.rect.has(id) ? id : liftTo(id, detailRank()))));
-  for (const e of state.linkList ?? []) if (focus.has(e.a) || focus.has(e.b)) { focus.add(e.a); focus.add(e.b); }
-  const order = [...lay.rect.keys()].sort((a, b) => (focus.has(b) - focus.has(a)) || N[b].lines - N[a].lines);
+  // Labels go to the focus first (the set, the hover, and their bright link
+  // ends), then by size. Both orders are cached.
+  lay.byLines ??= [...lay.rect.keys()].sort((a, b) => N[b].lines - N[a].lines);
+  const fsig = `${state.linkVer}|${state.hover}|${state.setVer}|${detailRank()}`;
+  if (lay.focus?.sig !== fsig) {
+    const focus = new Set(focusIds().map((id) => (lay.rect.has(id) ? id : liftTo(id, detailRank()))));
+    for (const e of [...R.linkLayers.set.list, ...R.linkLayers.hover.list]) if (focus.has(e.a) || focus.has(e.b)) { focus.add(e.a); focus.add(e.b); }
+    lay.focus = { sig: fsig, set: focus, order: [...lay.byLines.filter((id) => focus.has(id)), ...lay.byLines.filter((id) => !focus.has(id))] };
+  }
+  const focus = lay.focus.set, order = lay.focus.order;
   let drawn = 0;
   for (const id of order) {
     const r = lay.rect.get(id);
@@ -1710,7 +1994,7 @@ function inkGraph(ctx) {
     if (!important && (sw < 9 || drawn > 700)) continue;
     const n = N[id];
     if (lay.kind === 'layers' && sh >= 11) {
-      const size = clamp(sh * 0.55, 9, 14);
+      const size = fontSize(sh * 0.55, 9, 14);
       ctx.font = `600 ${size}px ${UI_FONT}`;
       const text = fitText(ctx, n.name, sw - 6);
       if (text) {
@@ -1721,7 +2005,7 @@ function inkGraph(ctx) {
         continue;
       }
     }
-    const size = important ? 12.5 : clamp(sw * 0.3, 10, 13);
+    const size = important ? 12.5 : fontSize(sw * 0.3, 10, 13);
     ctx.font = `${important ? 650 : 550} ${size}px ${UI_FONT}`;
     const text = fitText(ctx, n.name, 180);
     const w = textWidth(ctx, text);
@@ -1805,38 +2089,25 @@ function inkGrip(ctx) {
 // Arrowheads at 92% along each bright link (600 at most, heaviest first),
 // and the hovered link drawn thicker. Changes-with links have no direction.
 function inkLinks(ctx) {
-  if (R.morph || !state.linkList?.length) return;
-  const list = linkScreens();
+  if (R.morph || !state.arrows?.length && !state.hoverLink) return;
+  const A = affine();
   const city3d = state.lay.kind === 'city';
+  const k = state.t.k;
   const quiet = readingCode() ? 0.45 : 1;
   let drawn = 0;
-  for (const { e, xy } of [...list].sort((p, q) => q.e.w - p.e.w)) {
+  for (const e of state.arrows ?? []) {
     if (drawn >= 600) break;
-    if (e.kind === 'change' && e.kinds?.size === 1) continue;
-    const n = xy.length / 2;
-    if (n < 2) continue;
-    let total = 0;
-    for (let i = 1; i < n; i++) total += Math.hypot(xy[i * 2] - xy[i * 2 - 2], xy[i * 2 + 1] - xy[i * 2 - 1]);
-    if (total < 14) continue;
-    let goal = total * 0.92, i = 1;
-    for (; i < n; i++) {
-      const seg = Math.hypot(xy[i * 2] - xy[i * 2 - 2], xy[i * 2 + 1] - xy[i * 2 - 1]);
-      if (goal <= seg) break;
-      goal -= seg;
-    }
-    if (i >= n) i = n - 1;
-    const ax = xy[i * 2 - 2], ay = xy[i * 2 - 1], bx = xy[i * 2], by = xy[i * 2 + 1];
-    const seg = Math.hypot(bx - ax, by - ay) || 1;
-    const t = Math.min(1, goal / seg);
-    const x = ax + (bx - ax) * t, y = ay + (by - ay) * t;
+    if (e.len * k < 14) continue;
+    const [px, py, pz, tx, ty, tz] = e.arrow;
+    const x = A.O[0] + px * A.u[0] + py * A.v[0] + pz * A.w[0], y = A.O[1] + px * A.u[1] + py * A.v[1] + pz * A.w[1];
     if (x < -10 || y < -10 || x > R.W + 10 || y > R.H + 10) continue;
-    if (city3d) {
-      const p = e.pts[i - 1], q = e.pts[i];
-      if (city.hidden(p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t, p[2] + (q[2] - p[2]) * t)) continue;
-    }
-    const dx = (bx - ax) / seg, dy = (by - ay) / seg;
+    if (city3d && city.hidden(px, py, pz)) continue;
+    let dx = tx * A.u[0] + ty * A.v[0] + tz * A.w[0], dy = tx * A.u[1] + ty * A.v[1] + tz * A.w[1];
+    const d = Math.hypot(dx, dy);
+    if (!d) continue;
+    dx /= d; dy /= d;
     const size = e.dir === 'pick' ? 9 : 7;
-    ctx.fillStyle = css(e.color ?? rgb(theme().accent), quiet);
+    ctx.fillStyle = (e.fill ??= [css(e.color, 1), css(e.color, 0.45)])[quiet === 1 ? 0 : 1];
     ctx.beginPath();
     ctx.moveTo(x + dx * size * 0.6, y + dy * size * 0.6);
     ctx.lineTo(x - dx * size * 0.6 - dy * size * 0.45, y - dy * size * 0.6 + dx * size * 0.45);
@@ -1845,13 +2116,14 @@ function inkLinks(ctx) {
     ctx.fill();
     drawn++;
   }
-  const hv = state.hoverLink && list.find((x) => x.e === state.hoverLink);
-  if (hv) {
-    ctx.strokeStyle = css(hv.e.color ?? rgb(theme().accent), 0.95);
+  const hv = state.hoverLink;
+  if (hv?.pts) {
+    const xy = linkScreen(hv, A);
+    ctx.strokeStyle = css(hv.color ?? rgb(theme().accent), 0.95);
     ctx.lineWidth = 3.2;
     ctx.lineJoin = 'round';
     ctx.beginPath();
-    for (let i = 0; i < hv.xy.length; i += 2) (i ? ctx.lineTo(hv.xy[i], hv.xy[i + 1]) : ctx.moveTo(hv.xy[i], hv.xy[i + 1]));
+    for (let i = 0; i < xy.length; i += 2) (i ? ctx.lineTo(xy[i], xy[i + 1]) : ctx.moveTo(xy[i], xy[i + 1]));
     ctx.stroke();
   }
 }
@@ -2091,7 +2363,7 @@ function setupZoom() {
     })
     .on('start', () => { el.classList.add('grab'); })
     .on('zoom', (e) => { state.t = e.transform; hideTip(); if (state.lay?.kind === 'city') city.viewChanged(); requestDraw(); })
-    .on('end', () => { el.classList.remove('grab'); if (state.lay?.kind === 'city') city.viewChanged(true); drawCrumbs(); });
+    .on('end', () => { el.classList.remove('grab'); if (state.lay?.kind === 'city') city.viewChanged(true); else buildLinks(); drawCrumbs(); });
   d3.select(el).call(zoom).on('dblclick.zoom', null);
 }
 
@@ -2440,6 +2712,11 @@ function showTip(id, line, cx, cy) {
   const tip = $('#tip');
   const n = node(id);
   if (!n || state.narrow) return;
+  // Same part and line: only move the tip.
+  const key = `${state.T.uid}|${id}|${line}|${state.stage.items.length}`;
+  if (tip.dataset.key === key && !tip.hidden) { placeTip(tip, cx, cy, true); return; }
+  tip.dataset.key = key;
+  tip.link = null;
   const T = state.T;
   const nums = [];
   nums.push(plural(n.lines, 'line'));
@@ -2458,6 +2735,9 @@ function showTip(id, line, cx, cy) {
 function showLinkTip(e, cx, cy) {
   const tip = $('#tip');
   if (state.narrow) return;
+  if (tip.link === e && !tip.hidden) { placeTip(tip, cx, cy, true); return; }
+  tip.link = e;
+  tip.dataset.key = '';
   const kinds = [...e.kinds].filter((k) => k !== 'dim').map((k) => LINK_NAMES[k] ?? k);
   const arrow = e.kind === 'change' ? '↔' : '→';
   const dir = { out: 'uses', in: 'used by', inside: 'inside the set', pick: 'selected' }[e.dir];
@@ -2469,9 +2749,10 @@ function showLinkTip(e, cx, cy) {
   placeTip(tip, cx, cy);
 }
 
-function placeTip(tip, cx, cy) {
+function placeTip(tip, cx, cy, same = false) {
   tip.hidden = false;
-  const w = tip.offsetWidth, hh = tip.offsetHeight;
+  if (!same) tip.size = [tip.offsetWidth, tip.offsetHeight];
+  const [w, hh] = tip.size;
   const v = viewport();
   // Keep the tip over the canvas: flip to the cursor's left before it would
   // cover the Selection panel or run off the screen.
@@ -2480,7 +2761,7 @@ function placeTip(tip, cx, cy) {
   tip.style.top = `${cy + 18 + hh > window.innerHeight - 8 ? cy - hh - 12 : cy + 18}px`;
 }
 
-function hideTip() { $('#tip').hidden = true; }
+function hideTip() { const tip = $('#tip'); tip.hidden = true; tip.dataset.key = ''; tip.link = null; }
 
 // ───────────────────────────── Bar ─────────────────────────────
 
@@ -2491,7 +2772,7 @@ function seg(options, value, pick, { label, cls = '', title } = {}) {
 }
 
 function picker(options, value, pick, { label, cls = '' } = {}) {
-  return h('label', { class: `seg ${cls}` },
+  return h('label', { class: `seg ${cls}`, title: label },
     h('span', { class: 'label' }, label),
     h('select', { onchange: (e) => pick(e.target.value), 'aria-label': label }, options.map((o) => h('option', { value: o.id, selected: o.id === value }, o.name))));
 }
@@ -2499,17 +2780,19 @@ function picker(options, value, pick, { label, cls = '' } = {}) {
 function drawBar() {
   document.body.classList.toggle('city', state.layout === 'city');
   const tools = $('#tools');
-  tools.replaceChildren(...[
+  // Three groups: the layout, how the view is drawn, and the app's buttons.
+  tools.replaceChildren(
     seg(LAYOUTS, state.layout, (id) => hub.emit('view.layout', id), { cls: 'wide', title: 'Layout' }),
-    picker(DETAILS, state.detail, (id) => hub.emit('view.detail', id), { label: 'Detail', cls: 'wide opt' }),
-    picker(PAINTS, state.paint, (id) => hub.emit('view.paint', id), { label: 'Color', cls: 'wide opt' }),
-    state.layout === 'city' ? picker(HEIGHTS, state.height, (id) => hub.emit('view.height', id), { label: 'Height', cls: 'wide opt' }) : null,
-    seg(LINK_MODES, state.links, (id) => hub.emit('view.links', id), { label: 'Links', cls: 'wide opt' }),
-    h('button', { class: 'icon-btn wide view-btn', title: 'View options', 'aria-label': 'View options', 'aria-pressed': String(state.dock === 'view'), onclick: () => hub.emit('dock.show', state.dock === 'view' ? 'check' : 'view') }, icon('view')),
-    h('button', { class: 'icon-btn wide', title: 'Fit all (F)', 'aria-label': 'Fit all', onclick: () => fitAll() }, icon('fit')),
-    h('button', { class: 'icon-btn', title: 'Settings', 'aria-label': 'Settings', onclick: () => hub.emit('box.open', 'setup') }, icon('setup')),
-    h('button', { class: 'icon-btn wide', title: 'Keys and help (?)', 'aria-label': 'Help', onclick: () => hub.emit('box.open', 'keys') }, icon('help')),
-  ].filter(Boolean));
+    h('div', { class: 'group wide opt', role: 'group', 'aria-label': 'View' },
+      picker(DETAILS, state.detail, (id) => hub.emit('view.detail', id), { label: 'Detail' }),
+      picker(PAINTS, state.paint, (id) => hub.emit('view.paint', id), { label: 'Color' }),
+      state.layout === 'city' ? picker(HEIGHTS, state.height, (id) => hub.emit('view.height', id), { label: 'Height' }) : null,
+      seg(LINK_MODES, state.links, (id) => hub.emit('view.links', id), { label: 'Links' })),
+    h('div', { class: 'group icons' },
+      h('button', { class: 'icon-btn view-btn', title: 'View options', 'aria-label': 'View options', 'aria-pressed': String(state.dock === 'view'), onclick: () => hub.emit('dock.show', state.dock === 'view' ? 'check' : 'view') }, icon('view')),
+      h('button', { class: 'icon-btn wide', title: 'Fit all (F)', 'aria-label': 'Fit all', onclick: () => fitAll() }, icon('fit')),
+      h('button', { class: 'icon-btn', title: 'Settings', 'aria-label': 'Settings', onclick: () => hub.emit('box.open', 'setup') }, icon('setup')),
+      h('button', { class: 'icon-btn wide', title: 'Keys and help (?)', 'aria-label': 'Help', onclick: () => hub.emit('box.open', 'keys') }, icon('help'))));
   const tabs = $('#tabs');
   const tab = (id, name, ic) => h('button', { 'aria-pressed': String(state.sheet === id), onclick: () => hub.emit('sheet.toggle', id) }, icon(ic), name);
   tabs.replaceChildren(tab('view', 'View', 'view'), tab('check', 'Check', 'check'), tab('change', 'Change', 'change'), tab('info', 'Selection', 'info'));
@@ -2526,18 +2809,30 @@ function drawCrumbs() {
     id = hit?.id ?? -1;
     if (id > 0 && T.N[id].kind !== 'dir' && T.N[id].kind !== 'repo') id = T.N[id].up;
   }
-  const path = id > 0 ? pathOf(id) : [];
+  // With one repo open, its name is already the map's title. Long paths fold
+  // their middle into one … button.
+  let path = id > 0 ? pathOf(id) : [];
+  if (T.kids[0].length === 1 && path.length > 1) path = path.slice(1);
+  const go = (p) => () => { hub.emit('pick.set', { ids: [p] }); flyTo(p); };
   const parts = [];
-  path.forEach((p, i) => {
-    if (i) parts.push(h('span', { class: 'sep' }, '/'));
-    parts.push(h('button', { title: where(p), onclick: () => { hub.emit('pick.set', { ids: [p] }); flyTo(p); } }, T.N[p].name));
-  });
-  el.replaceChildren(...(parts.length ? parts : [h('button', { onclick: () => fitAll() }, `${state.model?.nodes.filter((n) => n.kind === 'repo').map((n) => n.name).join(', ') || 'workspace'}`)]));
+  const folded = path.length > 3 ? path.slice(0, -2) : [];
+  if (folded.length) parts.push(h('button', { class: 'fold', title: folded.map((p) => T.N[p].name).join(' / '), 'aria-label': `Up to ${T.N[folded.at(-1)].name}`, onclick: go(folded.at(-1)) }, '…'));
+  for (const p of path.slice(folded.length)) {
+    if (parts.length) parts.push(h('span', { class: 'sep' }, '/'));
+    parts.push(h('button', { title: where(p), onclick: go(p) }, T.N[p].name));
+  }
+  el.replaceChildren(...(parts.length ? parts : [h('button', { onclick: () => fitAll() }, T.kids[0].map((id) => T.N[id].name).join(', ') || 'workspace')]));
 }
 
 // ───────────────────────────── Find ─────────────────────────────
 
-const findNodes = (q) => (state.T ? S.findByName(state.T.I, q) : []);
+// Name matches, cached for the last query (Find runs it for the map and the list).
+let findCache = { T: null, q: null, ids: [] };
+function findNodes(q) {
+  if (!state.T) return [];
+  if (findCache.T !== state.T || findCache.q !== q) findCache = { T: state.T, q, ids: S.findByName(state.T.I, q) };
+  return findCache.ids;
+}
 const detailName = () => DETAILS.find((d) => d.id === state.detail)?.name.toLowerCase() ?? 'parts';
 
 function highlight(name, q) {
@@ -2712,8 +3007,24 @@ function drawDock() {
     which === 'check' ? h('button', { class: 'btn ghost small', title: 'Show issues marked as fine', 'aria-pressed': String(state.showWaived), onclick: () => hub.emit('check.waived', !state.showWaived) }, state.showWaived ? 'Hide waived' : 'Show waived') : null,
     which === 'change' && state.agent.log.length ? h('button', { class: 'btn ghost small', title: 'Start a new conversation', onclick: () => hub.emit('agent.reset') }, 'New chat') : null,
     h('button', { class: 'btn ghost small', title: 'Close panel', 'aria-label': 'Close panel', onclick: () => hub.emit('dock.show', null) }, icon('close')));
-  if (which === 'check') dock.replaceChildren(head, drawCheck());
-  else dock.replaceChildren(head, ...drawChange());
+  if (which === 'check') mount(dock, [head, checkBody()]);
+  else mount(dock, [head, ...drawChange(dock.querySelector('.change-log'))]);
+}
+
+// Put `kids` in `el`, leaving children that stay in place (by identity) so
+// their scroll position and focus survive a redraw.
+function mount(el, kids) {
+  const keep = new Set(kids);
+  for (const c of [...el.children]) if (!keep.has(c)) c.remove();
+  let at = el.firstElementChild;
+  for (const k of kids) { if (k === at) at = at.nextElementSibling; else el.insertBefore(k, at); }
+}
+
+// The Check body is rebuilt only when what it lists changes.
+function checkBody() {
+  const sig = `${state.T?.uid}|${state.showWaived}|${state.spot}|${state.expanded}`;
+  if (state.checkBody?.sig !== sig) state.checkBody = { sig, el: drawCheck() };
+  return state.checkBody.el;
 }
 
 function viewSheet() {
@@ -2761,7 +3072,7 @@ function drawCheck() {
   body.append(h('div', { class: 'section' },
     h('h3', null, 'Review', h('span', { class: 'count' }, `${pct}%`)),
     h('div', { class: 'meter', role: 'progressbar', 'aria-valuenow': pct, 'aria-valuemin': 0, 'aria-valuemax': 100 }, h('i', { style: { width: `${pct}%` } })),
-    h('div', { class: 'note' }, `${fmt(cov.done)} of ${fmt(cov.total)} lines marked reviewed. Select something and press R to mark it.`)));
+    h('div', { class: 'note' }, `${fmt(cov.done)} of ${fmt(cov.total)} lines reviewed. Press R to mark the selection.`)));
   const byRule = d3.group(issues, (i) => i.rule);
   const rules = m.rules.filter((r) => byRule.has(r.id)).map((r) => {
     const list = byRule.get(r.id);
@@ -2787,9 +3098,10 @@ function drawCheck() {
       const sorted = [...r.list].sort((a, b) => LEVEL_RANK[b.level] - LEVEL_RANK[a.level] || where(a.node).localeCompare(where(b.node)));
       for (const iss of sorted.slice(0, state.expanded === r.id ? 2000 : 60)) {
         const n = node(iss.node);
-        items.append(h('div', { class: `item${iss.waived ? ' waived' : ''}`, tabindex: 0, onclick: () => { hub.emit('pick.set', { ids: [iss.node], line: iss.line }); flyTo(iss.node); }, onkeydown: (e) => { if (e.key === 'Enter') e.currentTarget.click(); }, onmouseenter: () => hub.emit('pick.hover', { id: iss.node }) },
-          h('div', { class: 'what' }, h('i', { class: `dot lv-${iss.level} shape-${iss.level}`, style: { marginRight: '7px' } }), nameOf(iss.node)),
-          h('div', { class: 'where' }, `${where(iss.node).replace(/:\d+$/, '')}:${iss.line}`),
+        const at = `${where(iss.node).replace(/:\d+$/, '')}:${iss.line}`;
+        items.append(h('div', { class: `item${iss.waived ? ' waived' : ''}`, tabindex: 0, title: at, onclick: () => { hub.emit('pick.set', { ids: [iss.node], line: iss.line }); flyTo(iss.node); }, onkeydown: (e) => { if (e.key === 'Enter') e.currentTarget.click(); }, onmouseenter: () => hub.emit('pick.hover', { id: iss.node }) },
+          h('div', { class: 'what' }, h('i', { class: `dot lv-${iss.level} shape-${iss.level}` }), nameOf(iss.node)),
+          h('div', { class: 'where' }, at.split('/').pop()),
           h('div', { class: 'why' }, iss.note),
           h('div', { class: 'acts' },
             h('button', { class: 'btn tiny ghost', title: 'Fix with agent', 'aria-label': 'Fix with agent', onclick: (e) => { e.stopPropagation(); runActOn('fix', { ...S.emptySet(), nodes: [n.key] }); } }, icon('change')),
@@ -2811,8 +3123,8 @@ function selectRule(rule) {
   setFrom(ids, { recipe: [{ rule }] });
 }
 
-function drawChange() {
-  const body = h('div', { class: 'panel-body' });
+function drawChange(prev) {
+  const body = h('div', { class: 'panel-body change-log' });
   const cfg = state.config;
   if (!cfg.hasKey) body.append(h('div', { class: 'notice' }, 'No API key set. The agent needs an endpoint, a model, and a key. ', h('button', { class: 'btn small', onclick: () => hub.emit('box.open', 'setup') }, 'Open settings')));
   const st = state.stage;
@@ -2841,21 +3153,35 @@ function drawChange() {
   for (const entry of state.agent.log) log.append(logEntry(entry));
   if (state.agent.busy && state.agent.log.at(-1)?.kind !== 'batch') log.append(h('div', { class: 'step' }, h('span', { class: 'busy' }, h('i'), h('i'), h('i')), 'Working…'));
   body.append(h('div', { class: 'section' }, h('h3', null, 'Agent'), state.agent.log.length ? log : h('div', { class: 'note' }, 'Select parts and pick an action in the Act bar, or ask in plain words. Edits are staged here for review before anything is written.')));
+  // Follow the conversation unless the reader has scrolled up.
+  const follow = !prev || prev.scrollTop + prev.clientHeight >= prev.scrollHeight - 24;
+  const top = prev?.scrollTop ?? 0;
+  requestAnimationFrame(() => { body.scrollTop = follow ? body.scrollHeight : top; });
+  return [body, promptBox()];
+}
+
+// The prompt box lives across redraws, so typing while the agent streams
+// keeps its text, caret, and focus.
+function promptBox() {
+  let P = state.prompt;
+  if (!P) {
+    const box = h('textarea', { id: 'prompt', rows: 3, 'aria-label': 'Message to the agent' });
+    const send = () => { const text = box.value.trim(); if (!text || state.agent.busy) return; box.value = ''; hub.emit('agent.ask', { prompt: text }); };
+    box.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } });
+    const scope = h('div', { class: 'scope' }), foot = h('div', { class: 'row end' });
+    P = state.prompt = { el: h('div', { class: 'prompt' }, scope, box, foot), box, scope, foot, send };
+  }
   const empty = setEmpty();
-  const box = h('textarea', { id: 'prompt', placeholder: empty ? 'Ask about or change the code…' : `Ask about or change the ${S.setSummary(state.set)}…`, rows: 3, 'aria-label': 'Message to the agent', onkeydown: (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } } });
-  box.value = state.draft ?? '';
-  box.addEventListener('input', () => { state.draft = box.value; });
-  const send = () => { const text = box.value.trim(); if (!text || state.agent.busy) return; state.draft = ''; hub.emit('agent.ask', { prompt: text }); };
-  const scope = h('div', { class: 'scope' },
+  P.box.placeholder = empty ? 'Ask about or change the code…' : `Ask about or change the ${S.setSummary(state.set)}…`;
+  P.scope.replaceChildren(
     h('span', { class: 'muted' }, 'Scope: '),
     h('button', { class: 'linkish', title: empty ? 'Select parts to narrow the scope' : 'Show the selection', onclick: () => { if (!empty) showSelection(); } }, empty ? 'the whole workspace' : state.set.name ?? S.setSummary(state.set)),
     h('span', { class: 'spacer' }),
     modeToggle());
-  const prompt = h('div', { class: 'prompt' }, scope, box, h('div', { class: 'row end' },
-    h('span', { class: 'muted', style: { fontSize: '12px', marginRight: 'auto' } }, cfg.model ? `${cfg.model}` : ''),
-    state.agent.busy ? h('button', { class: 'btn small', onclick: () => wire.ask('agent.stop') }, icon('stop'), state.agent.halting ? 'Stop now' : 'Stop') : h('button', { class: 'btn primary small', onclick: send }, icon('send'), 'Send')));
-  setTimeout(() => { body.scrollTop = body.scrollHeight; }, 0);
-  return [body, prompt];
+  P.foot.replaceChildren(
+    h('span', { class: 'muted model' }, state.config.model ?? ''),
+    state.agent.busy ? h('button', { class: 'btn small', onclick: () => wire.ask('agent.stop') }, icon('stop'), state.agent.halting ? 'Stop now' : 'Stop') : h('button', { class: 'btn primary small', onclick: P.send }, icon('send'), 'Send'));
+  return P.el;
 }
 
 function modeToggle() {
@@ -2868,7 +3194,17 @@ function selectChanged() {
   setFrom(ids, { recipe: [{ staged: true }] });
 }
 
+// A log entry's element, kept on the entry so redraws reuse it; batches
+// change as they run and agent text grows, so those refresh in place.
 function logEntry(e) {
+  if (e.el && e.kind !== 'batch') {
+    if (e.kind === 'text' && e.shown !== e.text) { renderText(e.el, e.text); e.shown = e.text; }
+    return e.el;
+  }
+  return (e.el = entryEl(e));
+}
+
+function entryEl(e) {
   if (e.kind === 'user') return h('div', { class: 'msg user' }, e.text.length > 600 ? e.text.slice(0, 600) + '…' : e.text, e.scope ? h('div', { class: 'scope-tag' }, e.scope) : null);
   if (e.kind === 'error') return h('div', { class: 'msg error' }, e.text);
   if (e.kind === 'batch') {
@@ -2889,7 +3225,7 @@ function logEntry(e) {
   }
   const el = h('div', { class: 'msg agent' });
   renderText(el, e.text);
-  e.el = el;
+  e.shown = e.text;
   return el;
 }
 
@@ -2956,15 +3292,14 @@ function selHead() {
   const T = state.T;
   const ids = selIds();
   const lines = d3.sum(ids, (id) => T.N[id].lines) + d3.sum(s.ranges, (r) => r[2] - r[1] + 1);
-  const live = s.recipe && (s.recipe.length > 1 || !s.recipe[0].seed) ? S.recipeName(s.recipe, state.model?.rules) : '';
+  const live = isLive(s) ? S.recipeName(s.recipe, state.model?.rules) : '';
   return h('div', { class: 'panel-head sel-head' },
     h('div', { class: 'sel-title' },
       h('b', null, s.name ?? (setEmpty() ? 'Selection' : S.setSummary(s))),
-      h('span', { class: 'muted' }, setEmpty() || !lines ? '' : plural(lines, 'line')),
-      live ? h('div', { class: 'live' }, h('span', null, `Live: ${live}`), h('button', { class: 'btn tiny ghost', title: 'Stop following the recipe; keep these members as they are', onclick: () => hub.emit('set.freeze') }, 'Freeze')) : null),
-    h('button', { class: 'btn ghost small', title: 'Saved sets', 'aria-label': 'Saved sets', onclick: (e) => askSets(e.currentTarget) }, icon('save'), state.saved.length ? h('span', { class: 'count' }, fmt(state.saved.length)) : null),
-    setEmpty() ? null : h('button', { class: 'btn ghost small', title: 'Save this set', onclick: (e) => askSave(e.currentTarget) }, 'Save'),
-    setEmpty() ? null : h('button', { class: 'btn ghost small', title: 'Isolate: dim everything else (I)', 'aria-pressed': String(state.isolate), onclick: () => hub.emit('set.isolate', !state.isolate) }, icon('isolate')),
+      h('span', { class: 'muted' }, setEmpty() || !lines ? '' : plural(lines, 'line'))),
+    live ? h('div', { class: 'live', title: 'A live set follows its recipe as the code changes' }, h('span', null, `Live · ${live}`), h('button', { class: 'btn tiny ghost', title: 'Stop following the recipe; keep these members as they are', onclick: () => hub.emit('set.freeze') }, 'Freeze')) : null,
+    h('button', { class: 'btn ghost small', title: 'Save this set, or load a saved one', 'aria-label': 'Sets', onclick: (e) => askSets(e.currentTarget) }, icon('save'), 'Sets', state.saved.length ? h('span', { class: 'count' }, fmt(state.saved.length)) : null),
+    setEmpty() ? null : h('button', { class: 'btn ghost small', title: 'Isolate: dim everything else (I)', 'aria-label': 'Isolate', 'aria-pressed': String(state.isolate), onclick: () => hub.emit('set.isolate', !state.isolate) }, icon('isolate')),
     h('button', { class: 'btn ghost small', 'aria-label': 'Clear the selection', title: 'Clear (Esc)', onclick: () => hub.emit('pick.clear') }, icon('close')));
 }
 
@@ -2984,13 +3319,12 @@ function drawOne(body, id) {
   if (fi) facts.push(['Used by', `${fmt(fi)} ${fi === 1 ? detailName().replace(/s$/, '') : detailName()}`]);
   const rv = reviewOf(id);
   facts.push(['Review', rv === 'ok' ? 'Reviewed' : rv === 'stale' ? 'Changed since review' : 'Not reviewed']);
-  if (T.count[id]) facts.push(['Issues', fmt(T.count[id])]);
   if (f?.gen) facts.push(['Generated', 'Yes']);
   body.append(h('div', { class: 'facts' }, facts.map(([a, b]) => h('div', { class: 'fact' }, h('span', null, a), h('b', null, String(b))))));
   if (n.head && n.kind !== 'part' && !f) body.append(h('div', { class: 'sig' }, n.head));
   if (f && n.kind !== 'repo' && n.kind !== 'dir') body.append(codePeek(id));
   if (n.bases?.length) body.append(h('div', { class: 'section' }, h('h3', null, 'Extends'), h('div', { class: 'note' }, n.bases.join(', '))));
-  const repo = f ? state.model.nodes.find((x) => x.kind === 'repo' && f.key.startsWith(x.key + '/')) : null;
+  const repo = f ? T.N[pathOf(f.id)[0]] : null;
   body.append(h('div', { class: 'acts-bar' },
     h('button', { class: 'btn small', onclick: () => flyTo(id) }, icon('zoom'), 'Zoom'),
     f ? h('button', { class: 'btn small', title: 'Open in the Code sheet (Shift+Enter)', onclick: () => openCode(id) }, icon('code'), 'Code') : null,
@@ -3002,7 +3336,7 @@ function drawOne(body, id) {
     const rules = new Map(state.model.rules.map((r) => [r.id, r]));
     body.append(h('div', { class: 'section', style: { marginTop: '14px' } }, h('h3', null, 'Findings', h('span', { class: 'count' }, fmt(shown.length))),
       shown.sort((a, b) => LEVEL_RANK[b.level] - LEVEL_RANK[a.level]).slice(0, 30).map((iss) => h('div', { class: `item${iss.waived ? ' waived' : ''}`, onclick: () => { hub.emit('pick.set', { ids: [iss.node], line: iss.line }); flyTo(iss.node); } },
-        h('div', { class: 'what' }, h('i', { class: `dot lv-${iss.level} shape-${iss.level}`, style: { marginRight: '7px' } }), rules.get(iss.rule)?.name ?? iss.rule),
+        h('div', { class: 'what' }, h('i', { class: `dot lv-${iss.level} shape-${iss.level}` }), rules.get(iss.rule)?.name ?? iss.rule),
         h('div', { class: 'why' }, `${iss.note} · line ${iss.line}`)))));
   }
   const { uses, users } = refsOf(id);
@@ -3049,9 +3383,14 @@ function drawMany(body, ids) {
   if (ids.length) {
     const groups = d3.group(ids, (id) => { const n = T.N[id]; const p = T.fileOf[id] >= 0 && n.kind !== 'file' ? T.fileOf[id] : n.up; return p > 0 ? where(p) : 'workspace'; });
     const list = h('div', { class: 'members', role: 'list' });
+    // At most 300 rows in all, so a 5,000-part set still opens at once.
+    let room = 300;
     for (const [title, members] of [...groups].sort((a, b) => a[0].localeCompare(b[0]))) {
+      if (room <= 0) { list.append(h('div', { class: 'note' }, `+${fmt(ids.length - 300)} more`)); break; }
       list.append(h('div', { class: 'member-group' }, title));
-      for (const id of members.slice(0, 80)) {
+      const shown = Math.min(80, room);
+      room -= shown;
+      for (const id of members.slice(0, shown)) {
         list.append(h('div', { class: 'member', role: 'listitem' },
           h('button', { class: 'ref', title: where(id), onclick: () => flyTo(id), onmouseenter: () => hub.emit('pick.hover', { id }) },
             h('span', { class: 'sw', style: { background: css(paintOf(id)) } }),
@@ -3060,7 +3399,7 @@ function drawMany(body, ids) {
             h('span', { class: 'n' }, short(T.N[id].lines))),
           h('button', { class: 'x', 'aria-label': `Remove ${T.N[id].name}`, title: 'Remove from the set', onclick: () => hub.emit('pick.drop', { key: T.N[id].key }) }, '×')));
       }
-      if (members.length > 80) list.append(h('div', { class: 'note' }, `+${members.length - 80} more`));
+      if (members.length > shown && room > 0) list.append(h('div', { class: 'note' }, `+${members.length - shown} more`));
     }
     body.append(h('div', { class: 'section' }, h('h3', null, 'Members', h('span', { class: 'count' }, fmt(ids.length))), list));
   }
@@ -3077,7 +3416,8 @@ function drawMany(body, ids) {
         h('button', { class: 'x', 'aria-label': 'Remove lines', onclick: () => hub.emit('pick.drop', { range: r }) }, '×'))))));
   }
   if (ids.length) {
-    const b = S.boundary(T.I, s, detailRank());
+    if (state.boundary?.set !== s || state.boundary.T !== T || state.boundary.rank !== detailRank()) state.boundary = { set: s, T, rank: detailRank(), value: S.boundary(T.I, s, detailRank()) };
+    const b = state.boundary.value;
     const row = (e, dir) => {
       const text = dir === 'inside' ? `${nameOf(e.a)} → ${nameOf(e.b)}` : dir === 'out' ? `${nameOf(e.a)} → ${nameOf(e.b)}` : `${nameOf(e.a)} → ${nameOf(e.b)}`;
       return h('button', { class: 'ref', title: 'Select this link bundle', onclick: () => hub.emit('pick.links', { links: [[T.N[e.a].key, T.N[e.b].key, '*']] }), onmouseenter: () => hub.emit('pick.hover', { id: dir === 'in' ? e.a : e.b }) },
@@ -3154,14 +3494,14 @@ function narrowTo(rule) {
   setFrom([...ids]);
 }
 
-// Grow buttons: Uses · Used by · Both · Path · Loop · Copies · Tests · Inside.
+// Grow buttons that apply to the set: Uses · Used by · Both · Path · Loop ·
+// Copies · Tests · Inside. The rest are in the > palette with the reason.
 function growRow() {
   const ops = [['out', 'Uses', ']'], ['in', 'Used by', '['], ['both', 'Both', ''], ['path', 'Path', ''], ['loop', 'Loop', ''], ['copies', 'Copies', ''], ['tests', 'Tests', ''], ['inside', 'Inside', '']];
-  return h('div', { class: 'section' }, h('h3', null, 'Grow'), h('div', { class: 'grow' }, ops.map(([op, name, key]) => {
-    const a = actions().find((x) => x.id === `grow-${op}`);
-    const reason = a ? whyNot(a) : null;
-    return h('button', { class: 'btn small', disabled: !!reason, title: reason ?? `${a?.about ?? name}${key ? ` (${key})` : ''}`, onclick: () => hub.emit('set.grow', { op }) }, name);
-  })));
+  const shown = ops.map(([op, name, key]) => [op, name, key, actionById(`grow-${op}`)]).filter(([, , , a]) => a && !whyNot(a));
+  if (!shown.length) return '';
+  return h('div', { class: 'section' }, h('h3', null, 'Grow'), h('div', { class: 'grow' }, shown.map(([op, name, key, a]) =>
+    h('button', { class: 'btn small', title: `${a.about ?? name}${key ? ` (${key})` : ''}`, onclick: () => hub.emit('set.grow', { op }) }, name))));
 }
 
 function countFiles(id) {
@@ -3216,7 +3556,7 @@ const CLIENT_ACTS = [
   { id: 'delete', name: 'Delete', key: 'Del', icon: 'trash', takes: 'nodes', about: 'Stage a delete of every part.', run: () => askDelete(selIds()) },
   { id: 'edit', name: 'Edit', key: 'Shift+Enter', icon: 'code', takes: 'editable', about: 'Open the code in the Code sheet to read and edit it.', run: () => openCode() },
   { id: 'isolate', name: 'Isolate', key: 'I', icon: 'isolate', takes: 'any', about: 'Dim everything outside the set.', run: () => hub.emit('set.isolate', !state.isolate) },
-  { id: 'save', name: 'Save set', icon: 'save', takes: 'any', about: 'Save the set by name. It stays live if it came from a query, rule, or grow.', run: () => askSave() },
+  { id: 'save', name: 'Save set', icon: 'save', takes: 'any', about: 'Save the set by name. It stays live if it came from a query, rule, or grow.', run: () => askSets() },
   { id: 'grow-out', name: 'Grow: uses', key: ']', icon: 'grow', takes: 'seed', about: 'Add what the set uses, one hop. } adds all hops.', run: () => hub.emit('set.grow', { op: 'out' }) },
   { id: 'grow-in', name: 'Grow: used by', key: '[', icon: 'grow', takes: 'seed', about: 'Add what uses the set, one hop. { adds all hops.', run: () => hub.emit('set.grow', { op: 'in' }) },
   { id: 'grow-both', name: 'Grow: both ways', icon: 'grow', takes: 'seed', about: 'Add what the set uses and what uses it, one hop.', run: () => hub.emit('set.grow', { op: 'both' }) },
@@ -3227,22 +3567,28 @@ const CLIENT_ACTS = [
   { id: 'grow-inside', name: 'Grow: inside', icon: 'grow', takes: 'container', about: 'Turn folders and files into their parts at the current Detail.', run: () => hub.emit('set.grow', { op: 'inside' }) },
 ];
 
+let actsCache = { acts: null, list: [] };
 function actions() {
-  const agent = state.acts.map((a) => ({ ...a, agent: true, icon: 'change', key: a.id === 'explain' ? 'X' : undefined }));
-  return [...agent, ...CLIENT_ACTS];
+  if (actsCache.acts !== state.acts) {
+    const agent = state.acts.map((a) => ({ ...a, agent: true, icon: 'change', key: a.id === 'explain' ? 'X' : undefined }));
+    actsCache = { acts: state.acts, list: [...agent, ...CLIENT_ACTS] };
+  }
+  return actsCache.list;
 }
 
 const actionById = (id) => actions().find((a) => a.id === id);
 
 // Does the set touch an open finding (members' subtrees, or lines in ranges)?
+// Members use the rolled-up open counts; ranges look at their file's findings.
 function touchesFindings(set = state.set) {
   const T = state.T;
-  const members = new Set(set.nodes.map(idOf).filter((id) => id >= 0));
-  for (const iss of state.model.issues) {
-    if (iss.waived) continue;
-    for (let p = iss.node; p > 0; p = T.N[p].up) if (members.has(p)) return true;
-    const f = T.fileOf[iss.node];
-    if (f >= 0 && set.ranges.some((r) => r[0] === T.N[f].key && iss.line >= r[1] && iss.line <= r[2])) return true;
+  for (const k of set.nodes) { const id = idOf(k); if (id >= 0 && T.count[id] > 0) return true; }
+  for (const [key, from, to] of set.ranges) {
+    const f = idOf(key);
+    if (f < 0 || !T.count[f]) continue;
+    let hit = false;
+    walk(f, (x) => { if (hit) return false; for (const i of T.issuesOf[x]) { const iss = state.model.issues[i]; if (!iss.waived && iss.line >= from && iss.line <= to) { hit = true; return false; } } });
+    if (hit) return true;
   }
   return false;
 }
@@ -3250,20 +3596,24 @@ function touchesFindings(set = state.set) {
 function hasCopies(set = state.set) {
   const T = state.T, m = state.model;
   if (set.links.some((l) => l[2] === 'copy' || (l[2] === '*' && S.linkIndices(T.I, l, 400).some((li) => m.linkKinds[m.links[li][2]] === 'copy')))) return true;
+  const copy = m.linkKinds.indexOf('copy');
   let found = false;
   for (const id of set.nodes.map(idOf).filter((x) => x >= 0)) {
-    walk(id, (x) => { if (found) return false; for (const li of [...T.out[x], ...T.inn[x]]) if (m.linkKinds[m.links[li][2]] === 'copy') { found = true; return false; } }, 5000);
+    walk(id, (x) => {
+      if (found) return false;
+      for (const li of T.out[x]) if (m.links[li][2] === copy) { found = true; return false; }
+      for (const li of T.inn[x]) if (m.links[li][2] === copy) { found = true; return false; }
+      for (const i of T.issuesOf[x]) { const iss = m.issues[i]; if (iss.rule === 'copy' && !iss.waived) { found = true; return false; } }
+    }, 5000);
     if (found) return true;
   }
-  return state.model.issues.some((i) => i.rule === 'copy' && !i.waived && set.nodes.some((k) => { const id = idOf(k); return id >= 0 && isUnder(i.node, id); }));
+  return false;
 }
 
 function inLoop(set = state.set) {
-  const T = state.T;
   const rank = detailRank();
-  const groups = S.strongGroups(S.liftGraph(T.I, rank).out);
-  const ids = set.nodes.map(idOf).filter((x) => x >= 0);
-  return groups.some((g) => ids.some((m) => g.includes(liftTo(m, rank)) || g.some((x) => isUnder(x, m))));
+  const loops = S.loopsAt(state.T.I, rank);
+  return set.nodes.some((k) => { const id = idOf(k); return id >= 0 && (loops.inLoop.has(liftTo(id, rank)) || loops.above.has(id)); });
 }
 
 // Why an action does not apply to a set, or null when it does.
@@ -3321,14 +3671,21 @@ function drawAct() {
   el.hidden = false;
   const v = viewport();
   el.style.left = state.narrow ? '' : `${v.x + v.w / 2}px`;
+  el.style.maxWidth = state.narrow ? '' : `${Math.max(240, v.w - 24)}px`;
+  const each = state.mode === 'each';
+  const acts = barActions().map((a) => h('button', { class: `btn small act-btn${a.agent ? ' agent' : ''}`, 'data-act': a.id, title: `${a.agent ? 'Agent: ' : ''}${a.about ?? a.name}${a.key ? ` (${a.key})` : ''}`, onclick: () => runAct(a.id) }, a.name));
+  const list = h('div', { class: 'act-list' }, acts);
   el.replaceChildren(
     h('button', { class: 'act-sum', title: 'Show the selection', onclick: showSelection }, h('b', null, state.set.name ?? S.setSummary(state.set))),
     h('span', { class: 'act-sep' }),
-    ...barActions().map((a) => h('button', { class: `btn small act-btn${a.agent ? ' agent' : ''}`, 'data-act': a.id, title: `${a.agent ? 'Agent: ' : ''}${a.about ?? a.name}${a.key ? ` (${a.key})` : ''}`, onclick: () => runAct(a.id) }, a.name)),
-    h('button', { class: 'btn small ghost', title: 'All actions for the set (A)', onclick: () => openPalette() }, icon('more'), 'More'),
-    h('span', { class: 'act-sep' }),
-    h('button', { class: 'btn small ghost act-mode', 'aria-pressed': String(state.mode === 'each'), 'aria-label': state.mode === 'each' ? 'Mode: one by one' : 'Mode: all at once', title: state.mode === 'each' ? 'One by one: one agent run per member, each with a fresh conversation. Click for all at once.' : 'All at once: one agent run with the whole set. Click for one by one.', onclick: () => hub.emit('act.mode', state.mode === 'each' ? 'together' : 'each') }, icon('each'), state.mode === 'each' ? 'Each' : 'All'),
+    list,
+    h('button', { class: 'btn small ghost', title: 'All actions for the set (A)', onclick: () => openPalette() }, icon('more'), state.narrow ? null : 'More'),
+    h('button', { class: 'btn small ghost act-mode', 'aria-pressed': String(each), 'aria-label': each ? 'Agent runs one by one' : 'Agent runs all at once', title: each ? 'One by one: one agent run per member, each with a fresh conversation. Click for all at once.' : 'All at once: one agent run with the whole set. Click for one by one.', onclick: () => hub.emit('act.mode', each ? 'together' : 'each') }, icon('each')),
     h('button', { class: 'btn small ghost', 'aria-label': 'Clear the selection', title: 'Clear (Esc)', onclick: () => hub.emit('pick.clear') }, icon('close')));
+  // Keep the bar inside the free space: with a mouse, drop actions from the
+  // end (More lists them all); on touch screens the actions scroll sideways.
+  if (!state.narrow) while (acts.length > 1 && list.scrollWidth > list.clientWidth + 1) acts.pop().remove();
+  list.classList.toggle('more', list.scrollWidth > list.clientWidth + 1);
 }
 
 function openPalette() {
@@ -3475,38 +3832,38 @@ function popNear(el) {
   return r ? [r.left + r.width / 2, r.bottom] : [window.innerWidth / 2, window.innerHeight / 3];
 }
 
-function askSave(anchor) {
-  if (setEmpty()) { toast('Select something first.', 'error'); return; }
-  const input = h('input', { type: 'text', value: state.set.name ?? '', placeholder: 'Name, like Checkout flow', 'aria-label': 'Set name' });
-  const go = async () => {
-    const name = input.value.trim();
-    if (!name) { input.focus(); return; }
-    unpop();
-    const r = await wire.ask('set.save', { set: { ...payload(state.set), id: state.set.id, name, recipe: state.set.recipe } });
-    if (r?.error) return;
-    state.set = { ...state.set, id: r.id, name };
-    toast(`Saved “${name}”.`, 'good');
-    drawSelection();
-    drawAct();
-  };
-  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); if (e.key === 'Escape') unpop(); });
-  const [x, y] = popNear(anchor);
-  const live = state.set.recipe && (state.set.recipe.length > 1 || !state.set.recipe[0].seed);
-  pop(x, y, h('p', null, state.set.id ? 'Save the set' : 'Save as a new set'), input,
-    h('div', { class: 'note' }, live ? 'It stays live: the recipe runs again after every rescan.' : 'Saved in this repo’s ledger. Find lists it when the box is empty.'),
-    h('div', { class: 'row end' }, h('button', { class: 'btn small ghost', onclick: unpop }, 'Cancel'), h('button', { class: 'btn small primary', onclick: go }, 'Save')));
-  setTimeout(() => input.select(), 10);
-}
-
+// One popover for sets: save the current one by name, and load or remove
+// saved ones.
 function askSets(anchor) {
   const [x, y] = popNear(anchor);
-  if (!state.saved.length) { pop(x, y, h('p', null, 'No saved sets yet.'), h('div', { class: 'note' }, 'Select parts, then Save. Sets live in each repo’s ledger.'), h('div', { class: 'row end' }, h('button', { class: 'btn small', onclick: unpop }, 'OK'))); return; }
-  pop(x, y, h('p', null, h('b', null, 'Saved sets')),
-    h('div', { class: 'sets' }, state.saved.map((st) => h('div', { class: 'member' },
-      h('button', { class: 'ref', onclick: () => { unpop(); loadSet(st); } }, h('span', { class: 'name' }, st.name), h('span', { class: 'n' }, S.setSummary(st))),
-      h('button', { class: 'x', 'aria-label': `Remove ${st.name}`, title: 'Remove this saved set', onclick: async () => { await wire.ask('set.drop', { id: st.id }); unpop(); } }, '×')))));
+  const kids = [];
+  if (!setEmpty()) {
+    const input = h('input', { type: 'text', value: state.set.name ?? '', placeholder: 'Name, like Checkout flow', 'aria-label': 'Set name' });
+    const go = async () => {
+      const name = input.value.trim();
+      if (!name) { input.focus(); return; }
+      unpop();
+      const r = await wire.ask('set.save', { set: { ...payload(state.set), id: state.set.id, name, recipe: state.set.recipe } });
+      if (r?.error) return;
+      state.set = { ...state.set, id: r.id, name };
+      toast(`Saved “${name}”.`, 'good');
+      drawSelection();
+      drawAct();
+    };
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); if (e.key === 'Escape') unpop(); });
+    kids.push(h('p', null, h('b', null, state.set.id ? 'Save the set' : 'Save as a new set')),
+      h('div', { class: 'row nowrap' }, input, h('button', { class: 'btn small primary', onclick: go }, 'Save')),
+      h('div', { class: 'note' }, isLive(state.set) ? 'It stays live: the recipe runs again after every rescan.' : 'Saved in this repo’s ledger.'));
+    setTimeout(() => input.select(), 10);
+  }
+  if (state.saved.length) {
+    kids.push(h('p', null, h('b', null, 'Saved sets')),
+      h('div', { class: 'sets' }, state.saved.map((st) => h('div', { class: 'member' },
+        h('button', { class: 'ref', onclick: () => { unpop(); loadSet(st); } }, h('span', { class: 'name' }, st.name), h('span', { class: 'n' }, S.setSummary(st))),
+        h('button', { class: 'x', 'aria-label': `Remove ${st.name}`, title: 'Remove this saved set', onclick: async () => { await wire.ask('set.drop', { id: st.id }); unpop(); } }, '×')))));
+  } else if (setEmpty()) kids.push(h('p', null, 'No saved sets yet.'), h('div', { class: 'note' }, 'Select parts, then save them here. Sets live in each repo’s ledger.'));
+  pop(x, y, ...kids);
 }
-
 // ───────────────────────────── Code sheet ─────────────────────────────
 // Read a file (its staged text when staged) with the set's range in view,
 // edit a range in place, and review the staged diff with per-hunk revert.
@@ -3570,35 +3927,57 @@ async function drawCode() {
     bodyEl = h('div', { class: 'diff-body' }, h('div', { class: 'empty' }, 'This file is deleted in the stage.'));
   } else {
     const tk = tokenize(text, lang);
-    const from = c.from ?? 1, to = c.to ?? tk.lines.length;
-    const rows = [];
-    let edit = null;
-    for (let li = 0; li < tk.lines.length; li++) {
-      const line = li + 1;
-      if (c.editing && line === from) {
-        const lines = text.split('\n');
-        const area = h('textarea', { class: 'code-edit', spellcheck: false, rows: Math.max(1, to - from + 1), 'aria-label': `Edit lines ${from} to ${to}` });
-        area.value = lines.slice(from - 1, to).join('\n');
-        const stage = async () => {
-          const r = await wire.ask('stage.edit', { key: c.key, from, to, text: area.value });
-          if (r?.error) return;
-          c.editing = false;
-          c.to = from + Math.max(0, area.value.replace(/\n$/, '').split('\n').length - 1);
-          drawCode();
-        };
-        area.addEventListener('keydown', (e) => {
-          if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); stage(); }
-          else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); c.editing = false; drawCode(); }
-          else if (e.key === 'Tab') { e.preventDefault(); area.setRangeText('  ', area.selectionStart, area.selectionEnd, 'end'); }
-        });
-        edit = area;
-        rows.push(h('tr', { class: 'edit' }, h('td', { class: 'no' }, `${from}–${to}`), h('td', null, area, h('div', { class: 'row end edit-acts' }, h('span', { class: 'muted' }, 'Ctrl/Cmd+S stages · Esc cancels'), h('button', { class: 'btn small ghost', onclick: () => { c.editing = false; drawCode(); } }, 'Cancel'), h('button', { class: 'btn small primary', onclick: stage }, 'Stage')))));
-        li = to - 1;
-        continue;
-      }
-      rows.push(h('tr', { class: line >= from && line <= to && c.from ? 'hl' : '', id: `code-l${line}` }, h('td', { class: 'no' }, line), h('td', null, spansToNodes(tk.lines[li], tk.spans[li]))));
+    const total = tk.lines.length;
+    const from = c.from ?? 1, to = c.to ?? total;
+    // Rows are built as one HTML string (fast for big files); very long files
+    // show a window around the target, with rows to show more.
+    const WINDOW = 4000;
+    if (total <= WINDOW) { c.start = 1; c.end = total; }
+    else {
+      if (c.start == null || c.end - c.start < WINDOW - 1) { c.start = Math.max(1, from - 1000); c.end = c.start + WINDOW - 1; }
+      c.start = Math.min(c.start, total); c.end = Math.min(c.end, total);
     }
-    bodyEl = h('div', { class: 'diff-body code-body' }, h('table', null, rows));
+    const html = [];
+    const more = (dir, n) => `<tr class="more"><td colspan="2"><button class="btn tiny ghost" data-more="${dir}">Show ${fmt(n)} ${dir < 0 ? 'earlier' : 'later'} lines</button></td></tr>`;
+    if (c.start > 1) html.push(more(-1, Math.min(2000, c.start - 1)));
+    for (let line = c.start; line <= c.end; line++) {
+      if (c.editing && line === from) { html.push('<tr class="edit"></tr>'); line = Math.max(line, to); continue; }
+      html.push(`<tr${line >= from && line <= to && c.from ? ' class="hl"' : ''} id="code-l${line}"><td class="no">${line}</td><td>${spansToHtml(tk.lines[line - 1], tk.spans[line - 1])}</td></tr>`);
+    }
+    if (c.end < total) html.push(more(1, Math.min(2000, total - c.end)));
+    const table = h('table');
+    table.innerHTML = html.join('');
+    table.addEventListener('click', (e) => {
+      const dir = +e.target.closest('[data-more]')?.dataset.more;
+      if (!dir) return;
+      if (dir < 0) c.start = Math.max(1, c.start - 2000); else c.end = Math.min(total, c.end + 2000);
+      drawCode();
+    });
+    const editRow = table.querySelector('tr.edit');
+    let edit = null;
+    if (editRow) {
+      const area = h('textarea', { class: 'code-edit', spellcheck: false, rows: Math.max(1, to - from + 1), 'aria-label': `Edit lines ${from} to ${to}` });
+      area.value = text.split('\n').slice(from - 1, to).join('\n');
+      const stage = async () => {
+        const r = await wire.ask('stage.edit', { key: c.key, from, to, text: area.value });
+        if (r?.error) return;
+        c.editing = false;
+        c.to = from + Math.max(0, area.value.replace(/\n$/, '').split('\n').length - 1);
+        drawCode();
+      };
+      area.addEventListener('keydown', (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); stage(); }
+        else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); c.editing = false; drawCode(); }
+        else if (e.key === 'Tab') { e.preventDefault(); area.setRangeText('  ', area.selectionStart, area.selectionEnd, 'end'); }
+      });
+      edit = area;
+      editRow.append(h('td', { class: 'no' }, `${from}–${to}`), h('td', null, area, h('div', { class: 'row end edit-acts' }, h('span', { class: 'muted' }, 'Ctrl/Cmd+S stages · Esc cancels'), h('button', { class: 'btn small ghost', onclick: () => { c.editing = false; drawCode(); } }, 'Cancel'), h('button', { class: 'btn small primary', onclick: stage }, 'Stage'))));
+    }
+    // Keep the reader's place when the sheet redraws (staging, more lines).
+    const prev = el.querySelector('.code-body');
+    bodyEl = h('div', { class: 'diff-body code-body' }, table);
+    if (prev && c.drawn) { const top = prev.scrollTop; requestAnimationFrame(() => { bodyEl.scrollTop = top; }); }
+    c.drawn = true;
     if (edit) setTimeout(() => { edit.focus(); edit.style.height = `${edit.scrollHeight + 4}px`; }, 0);
   }
   el.replaceChildren(head, bodyEl);
@@ -3607,6 +3986,23 @@ async function drawCode() {
     c.scrolled = true;
     setTimeout(() => el.querySelector(`#code-l${Math.max(1, c.from - 3)}`)?.scrollIntoView({ block: 'start' }), 0);
   }
+}
+
+const escHtml = (s) => s.replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[ch]);
+const TK_CLASS = ['', 'tk-kw', 'tk-str', 'tk-num', 'tk-com', 'tk-type', 'tk-fn', ''];
+
+// One highlighted code line as HTML (for the Code sheet's string-built rows).
+function spansToHtml(line, spans) {
+  let out = '', at = 0;
+  for (let s = 0; s < spans.length; s += 3) {
+    const start = spans[s], len = spans[s + 1];
+    if (start > at) out += escHtml(line.slice(at, start));
+    const c = TK_CLASS[spans[s + 2]];
+    const text = escHtml(line.substr(start, len));
+    out += c ? `<span class="${c}">${text}</span>` : text;
+    at = start + len;
+  }
+  return out + escHtml(line.slice(at));
 }
 
 function spansToNodes(line, spans) {
@@ -3669,9 +4065,7 @@ function drawSetupBox() {
   const style = h('textarea', { rows: 5, placeholder: 'How you like code shaped. Example: Small files. One class per file. Guard clauses over nesting. No abbreviations.' });
   style.value = c.style ?? '';
   const result = h('div', { class: 'note' });
-  const themeSeg = seg([{ id: 'dark', name: 'Dark' }, { id: 'light', name: 'Light' }, { id: 'system', name: 'System' }], state.theme, (id) => { hub.emit('view.theme', id); drawSetupBox(); });
-  themeSeg.style.background = 'var(--raise)';
-  themeSeg.style.borderRadius = '9px';
+  const themeSeg = seg([{ id: 'dark', name: 'Dark' }, { id: 'light', name: 'Light' }, { id: 'system', name: 'System' }], state.theme, (id) => { hub.emit('view.theme', id); drawSetupBox(); }, { cls: 'boxed' });
   const patch = () => ({ endpoint: endpoint.value.trim(), model: model.value.trim(), style: style.value, maxTurns: +turns.value || 40, ...(key.value ? { apiKey: key.value.trim() } : {}) });
   box.replaceChildren(
     h('div', { class: 'box-head' }, h('h2', null, 'Settings'), h('p', null, 'The agent talks to any OpenAI-compatible endpoint.')),
@@ -3798,6 +4192,8 @@ function rampBrush(paint) {
     const top = hi >= 0.98 ? Infinity : hi;
     const n = S.partsAt(state.T.I, detailRank()).filter((id) => S.classMatches(classOf(id, paint, ctx), { lo, hi: top })).length;
     const tip = $('#tip');
+    tip.dataset.key = '';
+    tip.link = null;
     tip.replaceChildren(h('b', null, `${measureLabel(paint, lo)} – ${top === Infinity ? 'max' : measureLabel(paint, hi)}`), h('div', { class: 'muted' }, `${fmt(n)} ${detailName()} · release to select`));
     tip.hidden = false;
     const tr = tip.getBoundingClientRect();
@@ -3824,7 +4220,16 @@ function legendFade() {
 }
 
 function drawFoot() {
+  drawLegend();
+  drawStatus();
+}
+
+// The legend only rebuilds when what it shows changes.
+function drawLegend() {
   const legend = $('#legend');
+  const sig = [state.T?.uid, state.paint, THEME.bg, state.links, !!state.linkList?.length, setEmpty(), selIds().length > 1, JSON.stringify(state.kinds), detailRank()].join('|');
+  if (legend.sig === sig) return;
+  legend.sig = sig;
   const th = theme();
   const keys = [];
   const rank = DETAILS.find((d) => d.id === state.detail)?.name.toLowerCase() ?? 'parts';
@@ -3875,11 +4280,15 @@ function drawFoot() {
   }
   legend.replaceChildren(...keys);
   if (!legendFade.soon) legendFade.soon = requestAnimationFrame(() => { legendFade.soon = 0; legendFade(); });
+}
+
+function drawStatus() {
   const status = $('#status');
   const s = state.model?.stats;
   const parts = [];
   if (state.scan && state.scan.done < state.scan.total) parts.push(h('span', null, `Scanning ${state.scan.repo}`), h('span', { class: 'bar' }, h('i', { style: { width: `${(state.scan.done / state.scan.total) * 100}%` } })));
-  if (s) parts.push(h('span', null, `${short(s.files)} files · ${short(s.lines)} lines · ${short(s.symbols)} parts · ${short(s.links)} links`));
+  if (R.laying) parts.push(h('span', null, 'Laying out the graph…'));
+  if (s) parts.push(h('span', { title: `${fmt(s.files)} files · ${fmt(s.lines)} lines · ${fmt(s.symbols)} parts · ${fmt(s.links)} links` }, `${short(s.files)} files · ${short(s.lines)} lines`));
   if (state.model?.preview) parts.push(h('span', { style: { color: STATUS.warn } }, 'Preview'));
   parts.push(h('span', { class: `live${state.live ? '' : ' off'}`, title: state.live ? 'Connected' : 'Disconnected' }));
   status.replaceChildren(...parts);
@@ -3892,9 +4301,9 @@ function toast(text, level = 'info') {
   if (/^Opening /.test(text)) el.dataset.opening = '1';
   const box = $('#toasts');
   box.append(el);
-  // Keep the stack short: the newest two plus any errors.
+  // One message at a time (the newest), plus any errors.
   const quiet = [...box.children].filter((t) => !t.classList.contains('error'));
-  for (const t of quiet.slice(0, -2)) t.remove();
+  for (const t of quiet.slice(0, -1)) t.remove();
   setTimeout(() => el.remove(), level === 'error' ? 6000 : 3200);
 }
 
@@ -3905,6 +4314,7 @@ function applyTheme() {
   root.dataset.theme = state.theme;
   const dark = state.theme === 'dark' || (state.theme === 'system' && !matchMedia('(prefers-color-scheme: light)').matches);
   root.dataset.resolved = dark ? 'dark' : 'light';
+  THEME = THEMES[root.dataset.resolved];
 }
 
 // ───────────────────────────── Messages ─────────────────────────────
@@ -4032,6 +4442,9 @@ hub.on('repo.model', (m) => {
   if (state.query) { state.matches = runFind(state.query); drawFind(); }
   if (state.code) drawCode();
   $('#open-box').open && state.config.repos?.length && $('#open-box').close();
+  // Work out what the first click needs (lifted links, loops, fan-in) while idle.
+  const T = state.T;
+  (window.requestIdleCallback ?? setTimeout)(() => { if (state.T === T) { S.loopsAt(T.I, detailRank()); S.fanin(T.I, detailRank()); } }, { timeout: 3000 });
 });
 
 hub.on('scan.step', (d) => { state.scan = d; drawFoot(); });
@@ -4049,6 +4462,7 @@ hub.on('file.text', ({ key, text, staged }) => {
 hub.on('file.links', (d) => {
   if (!d?.key) return;
   state.sites.set(d.key, d);
+  state.sitesVer = (state.sitesVer ?? 0) + 1;
   state.wantedSites.delete(d.key);
   if (state.set.links.length) buildLinks();
   if (state.panelFiles?.has(d.key)) drawSelection();
@@ -4095,7 +4509,7 @@ hub.on('agent.step', (d) => {
   } else if (d.kind === 'text') {
     if (batch && d.index != null) { batch.text[d.index] = (batch.text[d.index] ?? '') + d.text; return; }
     const last = log.at(-1);
-    if (last?.kind === 'text') { last.text += d.text; if (last.el?.isConnected) { renderText(last.el, last.text); return; } }
+    if (last?.kind === 'text') { last.text += d.text; if (last.el?.isConnected) { renderText(last.el, last.text); last.shown = last.text; return; } }
     else log.push({ kind: 'text', text: d.text });
   } else if (d.kind === 'tool') {
     if (!batch) log.push(d);
@@ -4140,7 +4554,8 @@ hub.on('view.layout', (id) => {
   relayout({ animate: true, fit: true });
   drawFoot();
   drawDock();
-  if ((id === 'graph' || id === 'layers') && state.lay?.rect.size > 900 && state.detail !== 'dir') toast(`${fmt(state.lay.rect.size)} parts shown. Set Detail to Folders (press D) for a clearer picture.`);
+  const parts = state.T && (id === 'graph' || id === 'layers') ? liftGraph(state.T, detailRank()).ids.length : 0;
+  if (parts > 900 && state.detail !== 'dir') toast(`${fmt(parts)} parts shown. Set Detail to Folders (press D) for a clearer picture.`);
 });
 hub.on('view.paint', (id) => {
   state.paint = id;
@@ -4177,7 +4592,10 @@ hub.on('pick.hover', ({ id, line = 0, site = null }) => {
   state.hover = id;
   state.hoverLine = line;
   state.hoverSite = site;
-  if (state.links === 'focus') buildLinks();
+  // Hover links follow once the pointer rests a moment, so sweeping across
+  // the map never waits on them.
+  clearTimeout(R.hoverLinks);
+  R.hoverLinks = setTimeout(() => { R.hoverLinks = 0; buildLinks(); requestDraw(); }, 50);
   if (state.lay?.kind === 'city') city.hoverChanged();
   requestDraw();
 });
@@ -4401,7 +4819,7 @@ function idle() {
     const check = () => {
       const view = document.querySelector('#view');
       const moving = view.__transition && Object.keys(view.__transition).length > 0;
-      const busy = R.morph || R.cam || frameAsked || state.pending > 0 || state.wanted.size > 0 || state.wantedSites.size > 0 || moving || city.busy();
+      const busy = R.morph || R.cam || R.laying || R.hoverLinks || frameAsked || state.pending > 0 || state.wanted.size > 0 || state.wantedSites.size > 0 || moving || city.busy();
       if (busy) setTimeout(check, 50);
       else requestAnimationFrame(() => requestAnimationFrame(() => resolve(true)));
     };
@@ -4430,7 +4848,7 @@ function boot() {
   $('#brand').addEventListener('click', () => hub.emit('box.open', 'open'));
   document.addEventListener('pointerdown', (e) => { if (!$('#ask').hidden && !$('#ask').contains(e.target)) unpop(); }, true);
   for (const box of document.querySelectorAll('dialog')) box.addEventListener('click', (e) => { if (e.target === box) box.close(); });
-  document.fonts?.ready.then(() => { measureMono(); widths.clear(); requestDraw(); });
+  document.fonts?.ready.then(() => { measureMono(); widths.clear(); widthCount = 0; requestDraw(); });
   drawFoot();
   wire.open();
 }
@@ -4445,25 +4863,24 @@ function centerOf(key) {
   return toScreen(r.x + r.w / 2, r.y + Math.min(r.h / 2, (r.head ?? r.h) / 2 + 1));
 }
 
-// The drawn link between two keys, as screen points.
+// The drawn (bright) link between two keys, as screen points.
+const drawnLink = (aKey, bKey) => { const a = idOf(aKey), b = idOf(bKey); return (state.linkList ?? []).find((e) => e.pts && e.dir !== 'dim' && e.a === a && e.b === b); };
 function linkPoints(aKey, bKey) {
-  const a = idOf(aKey), b = idOf(bKey);
-  const hit = linkScreens().find(({ e }) => e.a === a && e.b === b);
-  if (!hit) return null;
+  const e = drawnLink(aKey, bKey);
+  if (!e) return null;
+  const xy = linkScreen(e);
   const out = [];
-  for (let i = 0; i < hit.xy.length; i += 2) out.push([hit.xy[i], hit.xy[i + 1]]);
+  for (let i = 0; i < xy.length; i += 2) out.push([xy[i], xy[i + 1]]);
   return out;
 }
 
 // The screen point halfway along the drawn link between two keys.
 function linkPoint(aKey, bKey) {
-  const a = idOf(aKey), b = idOf(bKey);
-  for (const { e, xy } of linkScreens()) {
-    if (e.a !== a || e.b !== b) continue;
-    const i = Math.floor(xy.length / 4) * 2;
-    return [xy[i], xy[i + 1]];
-  }
-  return null;
+  const e = drawnLink(aKey, bKey);
+  if (!e) return null;
+  const xy = linkScreen(e);
+  const i = Math.floor(xy.length / 4) * 2;
+  return [xy[i], xy[i + 1]];
 }
 
 window.devibe = {

@@ -310,7 +310,6 @@ export function makeCity(env) {
     const th = env.theme;
     const bg = env.rgb(th.bg);
     const lit = env.makeLit();
-    const ctx = env.classCtx();
     const g = C.geo;
     const col = g.getAttribute('aColor').array;
     const T = state.T;
@@ -327,7 +326,7 @@ export function makeCity(env) {
       let c;
       if (b.part === 'ghost') c = env.rgb(b.ghost === 'gone' ? env.STATUS.critical : env.STATUS.good);
       else {
-        c = env.colorOf(env.classOf(b.id, state.paint, ctx), b.id);
+        c = env.paintOf(b.id);
         if (b.part === 'dir') c = env.mix(c, env.rgb(th.ink3), 0.12);
         if (b.part === 'lot') c = env.mix(c, bg, 0.5);
         if (lit && !lit(b.id)) c = env.mix(c, bg, b.part === 'dir' ? 0.45 : 0.78);
@@ -339,7 +338,7 @@ export function makeCity(env) {
       }
       if (C.cut.has(i)) ghost = true;
       C.ghostOf[i] = ghost ? 1 : 0;
-      col.set([c[0], c[1], c[2], 1], i * 4);
+      col[i * 4] = c[0]; col[i * 4 + 1] = c[1]; col[i * 4 + 2] = c[2]; col[i * 4 + 3] = 1;
     });
     g.getAttribute('aColor').needsUpdate = true;
     let sig = 0;
@@ -383,7 +382,7 @@ export function makeCity(env) {
   const proj = (A, x, y, z) => [A.O[0] + x * A.u[0] + y * A.v[0] + z * A.w[0], A.O[1] + x * A.u[1] + y * A.v[1] + z * A.w[1]];
 
   // Geometry at rest, with the reading pose applied.
-  function rest(i) {
+  function rest(i, out = {}) {
     const o = i * 6;
     const t = C.to;
     const b = C.inst[i];
@@ -393,36 +392,53 @@ export function makeCity(env) {
       z = b.zb + (z - b.zb) * f;
       d *= f;
     }
-    return { x: t[o], y: t[o + 1], w: t[o + 2], h: t[o + 3], z, d };
+    out.x = t[o]; out.y = t[o + 1]; out.w = t[o + 2]; out.h = t[o + 3]; out.z = z; out.d = d;
+    return out;
   }
   const restOf = (b) => { const i = C.index.get(b.key); return i == null ? { x: b.x, y: b.y, w: b.w, h: b.h, z: b.z, d: b.d } : rest(i); };
   const topOf = (b) => { const r = restOf(b); return r.z + r.d; };
 
   // ───────────── Skyline ─────────────
 
+  // The boxes over each cell, in flat arrays: cell c holds
+  // items[start[c] .. start[c + 1]). Built in two passes (count, then fill).
   function grid(filter) {
     const L = C.lay;
     const b = L.bounds;
-    const lots = [...L.files.values()].map((F) => F.lot.w * F.lot.h).filter((a) => a > 0).sort((p, q) => p - q);
-    const median = lots.length ? lots[Math.floor(lots.length / 2)] : b.w * b.h / 100;
-    const cell = Math.max(Math.sqrt(median), b.w / 256, b.h / 256, 1e-6);
-    const nx = Math.max(1, Math.min(256, Math.ceil(b.w / cell))), ny = Math.max(1, Math.min(256, Math.ceil(b.h / cell)));
+    if (!L.cell) {
+      const lots = [...L.files.values()].map((F) => F.lot.w * F.lot.h).filter((a) => a > 0).sort((p, q) => p - q);
+      const median = lots.length ? lots[Math.floor(lots.length / 2)] : b.w * b.h / 100;
+      L.cell = Math.max(Math.sqrt(median), b.w / 256, b.h / 256, 1e-6);
+    }
+    const nx = Math.max(1, Math.min(256, Math.ceil(b.w / L.cell))), ny = Math.max(1, Math.min(256, Math.ceil(b.h / L.cell)));
     const cw = b.w / nx, ch = b.h / ny;
-    const cells = Array.from({ length: nx * ny }, () => []);
-    const box = new Float32Array(C.inst.length * 6);
+    const n = C.inst.length;
+    const box = new Float32Array(n * 6);
+    const span = new Int32Array(n * 4).fill(-1);
+    const start = new Int32Array(nx * ny + 1);
     let maxZ = 0, count = 0;
-    C.inst.forEach((it, i) => {
-      if (!filter(it, i)) return;
-      const r = rest(i);
-      if (r.d <= 1e-4 || r.w <= 0 || r.h <= 0) return;
-      box.set([r.x, r.y, r.x + r.w, r.y + r.h, r.z, r.z + r.d], i * 6);
+    const r = {};
+    for (let i = 0; i < n; i++) {
+      if (!filter(C.inst[i], i)) continue;
+      rest(i, r);
+      if (r.d <= 1e-4 || r.w <= 0 || r.h <= 0) continue;
+      const o = i * 6;
+      box[o] = r.x; box[o + 1] = r.y; box[o + 2] = r.x + r.w; box[o + 3] = r.y + r.h; box[o + 4] = r.z; box[o + 5] = r.z + r.d;
       maxZ = Math.max(maxZ, r.z + r.d);
       const gx0 = clamp(Math.floor((r.x - b.x) / cw), 0, nx - 1), gx1 = clamp(Math.floor((r.x + r.w - b.x) / cw), 0, nx - 1);
       const gy0 = clamp(Math.floor((r.y - b.y) / ch), 0, ny - 1), gy1 = clamp(Math.floor((r.y + r.h - b.y) / ch), 0, ny - 1);
-      for (let gy = gy0; gy <= gy1; gy++) for (let gx = gx0; gx <= gx1; gx++) cells[gy * nx + gx].push(i);
+      span[i * 4] = gx0; span[i * 4 + 1] = gx1; span[i * 4 + 2] = gy0; span[i * 4 + 3] = gy1;
+      for (let gy = gy0; gy <= gy1; gy++) for (let gx = gx0; gx <= gx1; gx++) start[gy * nx + gx + 1]++;
       count++;
-    });
-    return { cells, box, nx, ny, cw, ch, x0: b.x, y0: b.y, maxZ, count };
+    }
+    for (let c = 0; c < nx * ny; c++) start[c + 1] += start[c];
+    const items = new Int32Array(start[nx * ny]);
+    const fill = start.slice(0, nx * ny);
+    for (let i = 0; i < n; i++) {
+      if (span[i * 4] < 0) continue;
+      for (let gy = span[i * 4 + 2]; gy <= span[i * 4 + 3]; gy++) for (let gx = span[i * 4]; gx <= span[i * 4 + 1]; gx++) items[fill[gy * nx + gx]++] = i;
+    }
+    return { start, items, box, nx, ny, cw, ch, x0: b.x, y0: b.y, maxZ, count, seen: new Uint32Array(n), stamp: 0 };
   }
 
   function skyBuild() {
@@ -459,16 +475,19 @@ export function makeCity(env) {
     let tMaxX = nextX(gx), tMaxY = nextY(gy);
     let best = null, bestZ = -Infinity;
     const hits = all ? new Set() : null;
-    const seen = new Set();
+    // Boxes span several cells; a stamp per walk tests each box once.
+    const seen = G.seen, stamp = ++G.stamp;
     let tCell = t0;
     for (let guard = 0; guard < G.nx + G.ny + 4; guard++) {
       const tExit = Math.min(tMaxX, tMaxY, t1);
-      for (const i of G.cells[gy * G.nx + gx]) {
-        if (seen.has(i)) continue;
-        seen.add(i);
+      const c = gy * G.nx + gx;
+      for (let k = G.start[c], end = G.start[c + 1]; k < end; k++) {
+        const i = G.items[k];
+        if (seen[i] === stamp) continue;
+        seen[i] = stamp;
         if (skip?.(i)) continue;
         const o = i * 6;
-        const [x0, y0, x1, y1, z0, z1] = [G.box[o], G.box[o + 1], G.box[o + 2], G.box[o + 3], G.box[o + 4], G.box[o + 5]];
+        const x0 = G.box[o], y0 = G.box[o + 1], x1 = G.box[o + 2], y1 = G.box[o + 3], z0 = G.box[o + 4], z1 = G.box[o + 5];
         let lo = Math.max(z0, zEnd), hi = Math.min(z1, zTop), face = 'top';
         for (let axis = 0; axis < 2; axis++) {
           const p = P0[axis], d = D[axis], a = axis ? y0 : x0, b = axis ? y1 : x1;
@@ -569,10 +588,13 @@ export function makeCity(env) {
     if (C.hoverOpen > 0) forced.add(C.hoverOpen);
     const want = [];
     let budget = BUDGET - C.lay.items.length - C.lay.ghosts.length;
+    const A = V.A;
     for (const F of C.lay.files.values()) {
-      const corners = [[F.lot.x, F.lot.y], [F.lot.x + F.lot.w, F.lot.y], [F.lot.x, F.lot.y + F.lot.h], [F.lot.x + F.lot.w, F.lot.y + F.lot.h]].map(([x, y]) => proj(V.A, x, y, F.lotTop));
-      const xs = corners.map((p) => p[0]), ys = corners.map((p) => p[1]);
-      const on = Math.max(...xs) > -80 && Math.min(...xs) < R.W + 80 && Math.max(...ys) > -80 && Math.min(...ys) < R.H + 80;
+      // The lot's screen bounds: its corner plus the projected sides (affine).
+      const L = F.lot;
+      const ox = A.O[0] + L.x * A.u[0] + L.y * A.v[0] + F.lotTop * A.w[0], oy = A.O[1] + L.x * A.u[1] + L.y * A.v[1] + F.lotTop * A.w[1];
+      const ux = L.w * A.u[0], uy = L.w * A.u[1], vx = L.h * A.v[0], vy = L.h * A.v[1];
+      const on = ox + Math.max(0, ux) + Math.max(0, vx) > -80 && ox + Math.min(0, ux) + Math.min(0, vx) < R.W + 80 && oy + Math.max(0, uy) + Math.max(0, vy) > -80 && oy + Math.min(0, uy) + Math.min(0, vy) < R.H + 80;
       if (!on && !forced.has(F.id)) continue;
       const short = Math.min(V.ul * F.lot.w, V.vl * F.lot.h);
       const open = forced.has(F.id) || short >= OPEN_AT || (C.open.has(F.id) && short >= CLOSE_AT);
@@ -901,8 +923,11 @@ export function makeCity(env) {
     };
     const take = (x, y, w, h) => { for (let gx = Math.floor(x / cell); gx <= Math.floor((x + w) / cell); gx++) for (let gy = Math.floor(y / cell); gy <= Math.floor((y + h) / cell); gy++) gridSet.add(gx * 4096 + gy); count++; };
     const onScreen = (p) => p[0] > -40 && p[1] > -20 && p[0] < R.W + 40 && p[1] < R.H + 20;
+    // Labels stay clear of the top bar and the screen's edges.
+    const topY = env.viewport().y - 4;
+    const clear = (x, y, w) => y > topY && x >= 2 && x + w <= R.W - 2;
     // Signs carry file names, with the staged glyph.
-    const files = [...C.lay.files.values()].sort((a, b) => b.lot.w * b.lot.h - a.lot.w * a.lot.h);
+    const files = C.lay.bySize ??= [...C.lay.files.values()].sort((a, b) => b.lot.w * b.lot.h - a.lot.w * a.lot.h);
     for (const F of files) {
       if (count >= 400) break;
       const s = F.sign;
@@ -912,7 +937,7 @@ export function makeCity(env) {
       const p = proj(A, s.x + s.w / 2, s.y + s.h / 2, top);
       if (!onScreen(p) || hidden(s.x + s.w / 2, s.y + s.h / 2, top)) continue;
       const n = T.N[F.id];
-      const size = clamp(V.vl * s.h * 0.55, 9.5, 14);
+      const size = env.fontSize(V.vl * s.h * 0.55, 9.5, 14);
       ctx.font = `600 ${size}px ${env.UI_FONT}`;
       const st = env.stageOf(F.id);
       const glyph = st ? ` ${{ add: '+', edit: '~', delete: '−' }[st]}` : '';
@@ -920,7 +945,7 @@ export function makeCity(env) {
       if (!text) continue;
       const w = env.textWidth(ctx, text);
       const lx = p[0] - w / 2;
-      if (!free(lx, p[1] - size / 2, w, size)) continue;
+      if (!clear(lx, p[1] - size / 2, w) || !free(lx, p[1] - size / 2, w, size)) continue;
       take(lx, p[1] - size / 2, w, size);
       env.haloText(ctx, text, lx, p[1], C.faint?.(F.id) ? th.ink3 : th.ink, th);
     }
@@ -939,7 +964,7 @@ export function makeCity(env) {
       const text = env.fitText(ctx, `${n.form === 'ctor' ? 'new' : n.form ?? n.kind} ${n.name}`, Math.min(V.ul * b.w - 10, 200));
       if (!text) continue;
       const w = env.textWidth(ctx, text);
-      if (!free(p[0] + 3, p[1] + 2, w + 10, 16)) continue;
+      if (!clear(p[0] + 3, p[1] + 2, w + 10) || !free(p[0] + 3, p[1] + 2, w + 10, 16)) continue;
       take(p[0] + 3, p[1] + 2, w + 10, 16);
       ctx.fillStyle = th.halo;
       ctx.beginPath();
@@ -949,7 +974,7 @@ export function makeCity(env) {
       ctx.fillText(text, p[0] + 8, p[1] + 10.5);
     }
     // District names at the plinth's front-left corner.
-    const dirs = C.lay.items.filter((b) => b.part === 'dir' && T.depth[b.id] <= 3).sort((a, b) => T.depth[a.id] - T.depth[b.id] || b.w * b.h - a.w * a.h);
+    const dirs = C.lay.districts ??= C.lay.items.filter((b) => b.part === 'dir' && T.depth[b.id] <= 3).sort((a, b) => T.depth[a.id] - T.depth[b.id] || b.w * b.h - a.w * a.h);
     for (const b of dirs) {
       if (count >= 400) break;
       const top = b.z + b.d;
@@ -961,7 +986,7 @@ export function makeCity(env) {
       ctx.font = `650 ${size}px ${env.UI_FONT}`;
       const text = env.fitText(ctx, n.kind === 'repo' && n.branch ? `${n.name} · ${n.branch}` : n.name, 180);
       const w = env.textWidth(ctx, text);
-      if (!free(p[0], p[1] - 8, w, 16) || hidden(b.x + b.w * 0.02, b.y + b.h * 0.02, top)) continue;
+      if (!clear(p[0], p[1] - 8, w) || !free(p[0], p[1] - 8, w, 16) || hidden(b.x + b.w * 0.02, b.y + b.h * 0.02, top)) continue;
       take(p[0], p[1] - 8, w, 16);
       env.haloText(ctx, text, p[0], p[1], C.faint?.(b.id) ? th.ink3 : th.ink, th);
     }

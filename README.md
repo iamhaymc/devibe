@@ -53,7 +53,7 @@ Or set them in **Settings** in the app (saved to `~/.devibe/config.json`). Check
 - **Zoom** with the wheel or a pinch. Keep zooming into a file to read its code. **Double-click** to zoom to a part, or to open code you can already read in the Code sheet.
 - **Layouts** (`1`–`4`): Map, Graph, Layers (base code at the bottom), City (3D). In City, right-drag or Alt+drag to orbit, `V` for Tilt, Top, or Low, and Height to choose what towers measure.
 - **Select** to build a set: click parts (Shift adds), click a link (Alt+click for the folders around it), click the gutter for lines, Shift+drag a box, click a legend color, or Select all on a Find query or a Check rule. The Selection panel shows its members, its interface (what it uses, what uses it, and where), and its findings.
-- **Grow** the set with `]` (what it uses) and `[` (what uses it), or Path, Loop, Copies, Tests, and Inside in the panel. Sets made from a query, rule, or grow stay live as the code changes; **Save** keeps them by name.
+- **Grow** the set with `]` (what it uses) and `[` (what uses it), or Path, Loop, Copies, Tests, and Inside in the panel. Sets made from a query, rule, or grow stay live as the code changes; **Sets** in the panel keeps them by name.
 - **Find** (`/`) by name, file text, or a query like `kind:func cx>10 in:web`. Type `>` for every action on the set.
 - **Color** (`C`) by language, size, complexity, churn, age, used by, issues, review, changes, or reach from the set.
 - **Act**: the bar under the map offers the actions that fit the set. Agent actions run all at once or one by one; Explain never edits. Rename (`F2`), move (drag the grip onto a folder, or a function onto a file), and delete without the agent.
