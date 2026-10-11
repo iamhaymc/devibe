@@ -714,7 +714,7 @@ textarea:focus, input:focus { border-color: var(--accent); }
 .ref .n { color: var(--ink-3); font-size: 12px; font-variant-numeric: tabular-nums; }
 .ref .k { color: var(--ink-3); font-size: 11px; width: 58px; flex: none; overflow: hidden; text-overflow: ellipsis; }
 .ref .sw { width: 8px; height: 8px; border-radius: 2px; flex: none; }
-.acts-bar { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.acts-bar { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 14px; }
 .outline .ref { padding-left: calc(6px + var(--d, 0) * 14px); }
 
 /* ── Foot ── */

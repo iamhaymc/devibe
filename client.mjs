@@ -1265,7 +1265,7 @@ function drawFrame(now) {
     if (p >= 1) { R.morph = null; buildLinks(); } else busy = true;
   }
   if (R.cam) {
-    const p = clamp((now - R.cam.t0) / R.cam.dur, 0, 1);
+    const p = clamp((now - R.cam.t0) / Math.max(1, R.cam.dur), 0, 1);
     const e = d3.easeCubicInOut(p);
     R.pitch = R.cam.from.pitch + (R.cam.to.pitch - R.cam.from.pitch) * e;
     R.yaw = R.cam.from.yaw + (R.cam.to.yaw - R.cam.from.yaw) * e;
@@ -2205,10 +2205,10 @@ function gripRect() {
   }
   if (!['type', 'func', 'space', 'part'].includes(n.kind)) return null;
   const p = lay.pieces.get(state.T.fileOf[id])?.find((it) => it.id === id);
-  if (!p || p.w * k < 40 || p.h * k < 14) return null;
-  const [sx, sy] = toScreen(p.x + p.w, p.y);
+  if (!p || p.w * k < 40 || p.h * k < 4) return null;
+  const [sx, sy] = toScreen(p.x + p.w, p.y + p.h / 2);
   const size = clamp(p.h * k * 0.8, 14, 22);
-  return { x: sx - size - 3, y: sy + 3, w: size, h: size, id };
+  return { x: sx - size - 3, y: sy - size / 2, w: size, h: size, id };
 }
 
 // Where a dragged part would land: folders for files and folders, files for
@@ -2977,7 +2977,7 @@ function drawOne(body, id) {
   if (f) facts.push(['Language', state.model.langs.find((l) => l.id === f.lang)?.name ?? f.lang], ['Commits', f.churn ?? 0], ['Changed', ago(f.time)]);
   if (n.kind === 'dir' || n.kind === 'repo') facts.push(['Files', fmt(countFiles(id))]);
   const fi = S.fanin(T.I, detailRank()).count[id];
-  if (fi) facts.push(['Used by', `${fmt(fi)} ${detailName()}`]);
+  if (fi) facts.push(['Used by', `${fmt(fi)} ${fi === 1 ? detailName().replace(/s$/, '') : detailName()}`]);
   const rv = reviewOf(id);
   facts.push(['Review', rv === 'ok' ? 'Reviewed' : rv === 'stale' ? 'Changed since review' : 'Not reviewed']);
   if (T.count[id]) facts.push(['Issues', fmt(T.count[id])]);
@@ -3109,6 +3109,7 @@ function drawLink(body, l) {
   body.append(h('div', { class: 'refs', style: { margin: '10px 0' } }, refRow(a, 0, null, 'out', 'From'), refRow(b, 0, null, 'in', 'To')));
   body.append(h('div', { class: 'facts' }, [...kinds].map(([k, w]) => h('div', { class: 'fact' }, h('span', null, LINK_NAMES[k] ?? k), h('b', null, `×${fmt(w)}`))), kinds.size ? null : h('div', { class: 'fact' }, h('span', null, 'Links'), h('b', null, 'none now'))));
   const sites = h('div', { class: 'sites' });
+  const listed = new Set();
   let shown = 0;
   for (const li of lis) {
     if (shown >= 60) break;
@@ -3121,6 +3122,8 @@ function drawLink(body, l) {
     const text = state.texts.get(fk);
     if (!text) wantText(fk);
     for (const line of siteLines(li)) {
+      if (listed.has(`${f}:${line}`)) continue;
+      listed.add(`${f}:${line}`);
       if (shown++ >= 60) break;
       sites.append(h('button', { class: 'site', title: `${T.N[s].name} → ${T.N[t].name} (${LINK_NAMES[m.linkKinds[k]]})`, onclick: () => { flyToLine(f, line); hub.emit('pick.hover', { id: s, line }); } },
         h('span', { class: 'where' }, `${T.N[f].name}:${line}`),
@@ -3233,7 +3236,7 @@ function touchesFindings(set = state.set) {
 
 function hasCopies(set = state.set) {
   const T = state.T, m = state.model;
-  if (set.links.some((l) => l[2] === 'copy')) return true;
+  if (set.links.some((l) => l[2] === 'copy' || (l[2] === '*' && S.linkIndices(T.I, l, 400).some((li) => m.linkKinds[m.links[li][2]] === 'copy')))) return true;
   let found = false;
   for (const id of set.nodes.map(idOf).filter((x) => x >= 0)) {
     walk(id, (x) => { if (found) return false; for (const li of [...T.out[x], ...T.inn[x]]) if (m.linkKinds[m.links[li][2]] === 'copy') { found = true; return false; } }, 5000);
@@ -3291,9 +3294,9 @@ function barActions() {
   if (touchesFindings()) order = ['fix', ...order.filter((x) => x !== 'fix')];
   order = [...order, 'docs', 'split', 'tests', 'decouple', 'merge', 'extract', 'review', 'move', 'edit', 'delete'];
   const out = [];
-  for (const id of order) {
+  for (const id of new Set(order)) {
     const a = actionById(id);
-    if (a && !whyNot(a) && !out.includes(a)) out.push(a);
+    if (a && !whyNot(a)) out.push(a);
     if (out.length >= 5) break;
   }
   return out;
@@ -3801,7 +3804,7 @@ function drawFoot() {
   const th = theme();
   const keys = [];
   const rank = DETAILS.find((d) => d.id === state.detail)?.name.toLowerCase() ?? 'parts';
-  const key = (color, label, pick, shape) => h('button', { class: 'key', title: pick ? `Select the ${rank} colored “${label}” (Shift adds)` : label, onclick: pick ? (e) => selectLegend(pick, label, e.shiftKey) : null },
+  const key = (color, label, pick, shape) => h('button', { class: 'key', 'data-key': pick?.key ?? null, title: pick ? (state.paint === 'reach' ? `Add the ${rank} within ${label} hop${label === '1' ? '' : 's'}` : `Select the ${rank} colored “${label}” (Shift adds)`) : label, onclick: pick ? (e) => selectLegend(pick, label, e.shiftKey) : null },
     h('i', { class: `sw${shape ? ' ' + shape : ''}`, style: { background: color } }), label);
   const paint = PAINTS.find((p) => p.id === state.paint);
   if (state.model) {
@@ -4076,6 +4079,7 @@ hub.on('agent.step', (d) => {
 
 hub.on('agent.done', (d) => {
   state.agent.busy = false;
+  state.agent.done = (state.agent.done ?? 0) + 1;
   state.agent.halting = false;
   const log = state.agent.log;
   if (d.batch && state.agent.batch) { state.agent.batch.done = true; state.agent.batch = null; }
@@ -4405,6 +4409,16 @@ function centerOf(key) {
   return toScreen(r.x + r.w / 2, r.y + Math.min(r.h / 2, (r.head ?? r.h) / 2 + 1));
 }
 
+// The drawn link between two keys, as screen points.
+function linkPoints(aKey, bKey) {
+  const a = idOf(aKey), b = idOf(bKey);
+  const hit = linkScreens().find(({ e }) => e.a === a && e.b === b);
+  if (!hit) return null;
+  const out = [];
+  for (let i = 0; i < hit.xy.length; i += 2) out.push([hit.xy[i], hit.xy[i + 1]]);
+  return out;
+}
+
 // The screen point halfway along the drawn link between two keys.
 function linkPoint(aKey, bKey) {
   const a = idOf(aKey), b = idOf(bKey);
@@ -4417,9 +4431,11 @@ function linkPoint(aKey, bKey) {
 }
 
 window.devibe = {
-  state, hub, wire, idle, flyTo, fitAll, pickAt, toScreen, centerOf, linkPoint, grip: gripRect, R, actions, runAct, barActions: () => barActions().map((a) => a.id),
+  state, hub, wire, idle, flyTo, fitAll, pickAt, toScreen, centerOf, linkPoint, linkPoints, grip: gripRect, R, actions, runAct, barActions: () => barActions().map((a) => a.id),
+  linePoint: (key, line, chars = 6) => { const f = idOf(key); const at = f >= 0 ? siteAnchor(f, line) : null; if (!at) return null; const c = (state.lay.map ?? state.lay).code.get(f); return toScreen(at[0] + chars * CODE.cw * c.lh, at[1], at[2] ?? 0); },
   pickLink: (sx, sy) => { const e = pickLink(sx, sy, 6); return e ? memberOfLink(e) : null; },
   setOf: () => state.set,
+  viewport: () => viewport(),
   city: city.debug,
 };
 boot();

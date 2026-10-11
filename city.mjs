@@ -1160,9 +1160,9 @@ export function makeCity(env) {
     const f = T.fileOf[id];
     if (f < 0 || !C.open.has(f)) return null;
     const b = (C.lay.byNode.get(id) ?? [])[0];
-    if (!b || V.ul * b.w < 40 || V.vl * b.h < 14) return null;
-    const p = proj(A, b.x + b.w, b.y, topOf(b));
-    return { x: p[0] - 22, y: p[1] + 2, w: 18, h: 18, id };
+    if (!b || V.ul * b.w < 40 || V.vl * b.h < 6) return null;
+    const p = proj(A, b.x + b.w, b.y + b.h / 2, topOf(b));
+    return { x: p[0] - 22, y: p[1] - 9, w: 18, h: 18, id };
   }
 
   function dropTarget(sx, sy, dragId) {
@@ -1223,6 +1223,11 @@ export function makeCity(env) {
   function hide() {
     if (!C.opaque) return;
     C.opaque.visible = C.glass.visible = false;
+    clearTimeout(C.cutTimer);
+    C.cutTimer = 0;
+    C.anim = null;
+    Object.assign(C.flat, { file: -1, key: null, t: 0, from: 0, to: 0, prevPitch: null });
+    uniformsEach((u) => { u.uFlat.value = 0; });
     C.lay = null;
     C.inst = [];
     C.index = new Map();
@@ -1281,7 +1286,7 @@ export function makeCity(env) {
     C.hoverTimer = setTimeout(() => { C.hoverOpen = f; plan(); }, f > 0 ? 260 : 600);
   }
 
-  const busy = () => !!C.anim || !!C.cutTimer || C.flat.t !== C.flat.to;
+  const busy = () => state.lay?.kind === 'city' && (!!C.anim || !!C.cutTimer || C.flat.t !== C.flat.to);
 
   const debug = {
     get open() { return [...C.open].map((id) => state.T.N[id].key); },
