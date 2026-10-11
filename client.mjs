@@ -2472,7 +2472,11 @@ function showLinkTip(e, cx, cy) {
 function placeTip(tip, cx, cy) {
   tip.hidden = false;
   const w = tip.offsetWidth, hh = tip.offsetHeight;
-  tip.style.left = `${Math.min(cx + 16, window.innerWidth - w - 8)}px`;
+  const v = viewport();
+  // Keep the tip over the canvas: flip to the cursor's left before it would
+  // cover the Selection panel or run off the screen.
+  const right = Math.min(window.innerWidth - 8, cx < v.x + v.w ? v.x + v.w : window.innerWidth - 8);
+  tip.style.left = `${Math.max(8, cx + 16 + w <= right ? cx + 16 : cx - 16 - w)}px`;
   tip.style.top = `${cy + 18 + hh > window.innerHeight - 8 ? cy - hh - 12 : cy + 18}px`;
 }
 
@@ -2956,7 +2960,7 @@ function selHead() {
   return h('div', { class: 'panel-head sel-head' },
     h('div', { class: 'sel-title' },
       h('b', null, s.name ?? (setEmpty() ? 'Selection' : S.setSummary(s))),
-      h('span', { class: 'muted' }, setEmpty() ? '' : plural(lines, 'line')),
+      h('span', { class: 'muted' }, setEmpty() || !lines ? '' : plural(lines, 'line')),
       live ? h('div', { class: 'live' }, h('span', null, `Live: ${live}`), h('button', { class: 'btn tiny ghost', title: 'Stop following the recipe; keep these members as they are', onclick: () => hub.emit('set.freeze') }, 'Freeze')) : null),
     h('button', { class: 'btn ghost small', title: 'Saved sets', 'aria-label': 'Saved sets', onclick: (e) => askSets(e.currentTarget) }, icon('save'), state.saved.length ? h('span', { class: 'count' }, fmt(state.saved.length)) : null),
     setEmpty() ? null : h('button', { class: 'btn ghost small', title: 'Save this set', onclick: (e) => askSave(e.currentTarget) }, 'Save'),
@@ -3002,15 +3006,18 @@ function drawOne(body, id) {
         h('div', { class: 'why' }, `${iss.note} · line ${iss.line}`)))));
   }
   const { uses, users } = refsOf(id);
-  if (uses.length) body.append(h('div', { class: 'section' }, h('h3', null, 'Uses', h('span', { class: 'count' }, fmt(uses.length))), h('div', { class: 'refs' }, uses.slice(0, 14).map(([x, w, kinds]) => refRow(x, w, kinds, 'out')))));
-  if (users.length) body.append(h('div', { class: 'section' }, h('h3', null, 'Used by', h('span', { class: 'count' }, fmt(users.length))), h('div', { class: 'refs' }, users.slice(0, 14).map(([x, w, kinds]) => refRow(x, w, kinds, 'in')))));
+  // Same-named parts (a struct and its impl) get their kind as a label.
+  const twin = (list) => { const seen = d3.rollup(list, (v) => v.length, ([x]) => nameOf(x)); return (x) => seen.get(nameOf(x)) > 1 ? formOf(x) : undefined; };
+  const tu = twin(uses.slice(0, 14)), tb = twin(users.slice(0, 14));
+  if (uses.length) body.append(h('div', { class: 'section' }, h('h3', null, 'Uses', h('span', { class: 'count' }, fmt(uses.length))), h('div', { class: 'refs' }, uses.slice(0, 14).map(([x, w, kinds]) => refRow(x, w, kinds, 'out', tu(x))))));
+  if (users.length) body.append(h('div', { class: 'section' }, h('h3', null, 'Used by', h('span', { class: 'count' }, fmt(users.length))), h('div', { class: 'refs' }, users.slice(0, 14).map(([x, w, kinds]) => refRow(x, w, kinds, 'in', tb(x))))));
   body.append(growRow());
   if (n.kind === 'file' && T.kids[id].length) {
     const rows = [];
     walk(id, (k) => { if (k !== id && rows.length < 120) rows.push(k); });
     rows.sort((a, b) => T.N[a].from - T.N[b].from);
     body.append(h('div', { class: 'section' }, h('h3', null, 'Outline'), h('div', { class: 'refs outline' }, rows.map((k) => h('button', { class: 'ref', style: { '--d': T.symDepth[k] }, onclick: () => { hub.emit('pick.set', { ids: [k] }); flyTo(k); } },
-      h('span', { class: 'k' }, T.N[k].form === 'ctor' ? 'new' : T.N[k].form === 'function' ? 'func' : T.N[k].form ?? T.N[k].kind), h('span', { class: 'name' }, T.N[k].name), h('span', { class: 'n' }, T.N[k].from))))));
+      h('span', { class: 'k' }, formOf(k)), h('span', { class: 'name' }, T.N[k].name), h('span', { class: 'n' }, T.N[k].from))))));
   }
   if (n.kind === 'dir' || n.kind === 'repo') {
     const files = [];
@@ -3161,6 +3168,12 @@ function countFiles(id) {
   let n = 0;
   walk(id, (k) => { if (state.T.N[k].kind === 'file') { n++; return false; } });
   return n;
+}
+
+// A part's short kind label: func, class, struct, new, file …
+function formOf(id) {
+  const n = state.T.N[id];
+  return n.form === 'ctor' ? 'new' : n.form === 'function' ? 'func' : n.form ?? n.kind;
 }
 
 function refRow(id, w, kinds, dir, label) {
@@ -3690,6 +3703,7 @@ const KEYS = [
   ['U', 'Select the parent'],
   [']  [', 'Grow the set by what it uses / what uses it, one hop'],
   ['}  {', 'The same, all hops'],
+  ['X', 'Explain the set (read-only agent run)'],
   ['A', 'All actions for the set (Find in > mode)'],
   ['I', 'Isolate the set'],
   ['V', 'City: next angle (Tilt, Top, Low)'],
@@ -3767,8 +3781,7 @@ function rampBrush(paint) {
   const th = theme();
   const ramp = h('i', { class: 'ramp', title: 'Click or drag to select a range', style: { background: `linear-gradient(90deg, ${th.ramp.join(',')})` } });
   const band = h('b', { class: 'band', hidden: true });
-  const label = h('span', { class: 'brush-label', hidden: true });
-  const wrap = h('span', { class: 'ramp-wrap' }, ramp, band, label);
+  const wrap = h('span', { class: 'ramp-wrap' }, ramp, band);
   let brush = null;
   const range = () => {
     const r = ramp.getBoundingClientRect();
@@ -3784,8 +3797,12 @@ function rampBrush(paint) {
     const ctx = classCtx();
     const top = hi >= 0.98 ? Infinity : hi;
     const n = S.partsAt(state.T.I, detailRank()).filter((id) => S.classMatches(classOf(id, paint, ctx), { lo, hi: top })).length;
-    label.hidden = false;
-    label.textContent = `${measureLabel(paint, lo)} – ${top === Infinity ? 'max' : measureLabel(paint, hi)} · ${fmt(n)} ${detailName()}`;
+    const tip = $('#tip');
+    tip.replaceChildren(h('b', null, `${measureLabel(paint, lo)} – ${top === Infinity ? 'max' : measureLabel(paint, hi)}`), h('div', { class: 'muted' }, `${fmt(n)} ${detailName()} · release to select`));
+    tip.hidden = false;
+    const tr = tip.getBoundingClientRect();
+    tip.style.left = `${clamp(r.left + ((lo + hi) / 2) * r.width - tr.width / 2, 8, window.innerWidth - tr.width - 8)}px`;
+    tip.style.top = `${r.top - tr.height - 12}px`;
   };
   ramp.addEventListener('pointerdown', (e) => { brush = { x0: e.clientX, x1: e.clientX }; ramp.setPointerCapture(e.pointerId); update(); });
   ramp.addEventListener('pointermove', (e) => { if (!brush) return; brush.x1 = e.clientX; update(); });
@@ -3793,10 +3810,17 @@ function rampBrush(paint) {
     if (!brush) return;
     const [lo, hi] = range();
     brush = null;
-    band.hidden = label.hidden = true;
+    band.hidden = true;
+    hideTip();
     selectLegend({ lo, hi: hi >= 0.98 ? 1e9 : hi }, `${measureLabel(paint, lo)}–${hi >= 0.98 ? 'max' : measureLabel(paint, hi)}`, e.shiftKey);
   });
   return wrap;
+}
+
+// Fade the legend's right edge while more keys are scrolled out of view.
+function legendFade() {
+  const l = $('#legend');
+  l.classList.toggle('more', l.scrollLeft + l.clientWidth < l.scrollWidth - 2);
 }
 
 function drawFoot() {
@@ -3837,7 +3861,7 @@ function drawFoot() {
     if (state.links !== 'none' && (state.linkList?.length || !setEmpty())) {
       keys.push(h('span', { class: 'title', style: { marginLeft: '8px' } }, 'Links'));
       if (state.links === 'focus') {
-        keys.push(h('span', { class: 'key' }, h('i', { class: 'sw', style: { background: th.series[0] } }), 'uses'), h('span', { class: 'key' }, h('i', { class: 'sw', style: { background: th.series[1] } }), 'used by'));
+        keys.push(h('span', { class: 'key', title: 'Links from the selection' }, h('i', { class: 'sw', style: { background: th.series[0] } }), 'outgoing'), h('span', { class: 'key', title: 'Links into the selection' }, h('i', { class: 'sw', style: { background: th.series[1] } }), 'incoming'));
         if (selIds().length > 1) keys.push(h('span', { class: 'key' }, h('i', { class: 'sw', style: { background: th.series[6] } }), 'inside'));
       }
       for (const kind of KIND_ORDER) {
@@ -3850,6 +3874,7 @@ function drawFoot() {
     }
   }
   legend.replaceChildren(...keys);
+  if (!legendFade.soon) legendFade.soon = requestAnimationFrame(() => { legendFade.soon = 0; legendFade(); });
   const status = $('#status');
   const s = state.model?.stats;
   const parts = [];
@@ -3865,7 +3890,11 @@ function drawFoot() {
 function toast(text, level = 'info') {
   const el = h('div', { class: `toast ${level}`, role: level === 'error' ? 'alert' : 'status' }, level === 'error' ? h('i', { class: 'dot lv-high' }) : level === 'good' ? h('i', { class: 'dot', style: { background: STATUS.good } }) : null, text);
   if (/^Opening /.test(text)) el.dataset.opening = '1';
-  $('#toasts').append(el);
+  const box = $('#toasts');
+  box.append(el);
+  // Keep the stack short: the newest two plus any errors.
+  const quiet = [...box.children].filter((t) => !t.classList.contains('error'));
+  for (const t of quiet.slice(0, -2)) t.remove();
   setTimeout(() => el.remove(), level === 'error' ? 6000 : 3200);
 }
 
@@ -4390,7 +4419,14 @@ function boot() {
   setupFind();
   setupKeys();
   resize();
-  window.addEventListener('resize', () => { resize(); });
+  window.addEventListener('resize', () => { resize(); legendFade(); });
+  const legend = $('#legend');
+  legend.addEventListener('scroll', legendFade);
+  legend.addEventListener('wheel', (e) => {
+    if (Math.abs(e.deltaY) <= Math.abs(e.deltaX) || legend.scrollWidth <= legend.clientWidth) return;
+    legend.scrollLeft += e.deltaY;
+    e.preventDefault();
+  }, { passive: false });
   $('#brand').addEventListener('click', () => hub.emit('box.open', 'open'));
   document.addEventListener('pointerdown', (e) => { if (!$('#ask').hidden && !$('#ask').contains(e.target)) unpop(); }, true);
   for (const box of document.querySelectorAll('dialog')) box.addEventListener('click', (e) => { if (e.target === box) box.close(); });

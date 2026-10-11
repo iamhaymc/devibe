@@ -319,6 +319,8 @@ export function makeCity(env) {
     const isoUp = new Set();
     if (iso) for (const m of iso) for (let p = m; p >= 0; p = T.N[p].up) isoUp.add(p);
     const inside = (id) => { for (let p = id; p >= 0; p = T.N[p].up) if (isoSet.has(p)) return true; return false; };
+    // Labels of parts isolated away are drawn faint (see ink).
+    C.faint = iso ? (id) => !inside(id) && !isoUp.has(id) : null;
     const before = C.ghostSig;
     C.ghostOf = new Uint8Array(C.inst.length);
     C.inst.forEach((b, i) => {
@@ -920,7 +922,7 @@ export function makeCity(env) {
       const lx = p[0] - w / 2;
       if (!free(lx, p[1] - size / 2, w, size)) continue;
       take(lx, p[1] - size / 2, w, size);
-      env.haloText(ctx, text, lx, p[1], th.ink, th);
+      env.haloText(ctx, text, lx, p[1], C.faint?.(F.id) ? th.ink3 : th.ink, th);
     }
     // Symbol names on roofs big enough to hold them.
     const roofsSeen = [];
@@ -931,7 +933,7 @@ export function makeCity(env) {
       if (V.ul * b.w < 40 || V.vl * b.h < 14 || !/\|s0$/.test(b.key)) continue;
       const top = topOf(b);
       const p = proj(A, b.x, b.y, top);
-      if (!onScreen(p) || hidden(b.x + b.w * 0.05, b.y + b.h * 0.05, top)) continue;
+      if (!onScreen(p) || hidden(b.x + b.w * 0.05, b.y + b.h * 0.05, top) || C.faint?.(b.id)) continue;
       const n = T.N[b.id];
       ctx.font = `600 11px ${env.UI_FONT}`;
       const text = env.fitText(ctx, `${n.form === 'ctor' ? 'new' : n.form ?? n.kind} ${n.name}`, Math.min(V.ul * b.w - 10, 200));
@@ -961,7 +963,7 @@ export function makeCity(env) {
       const w = env.textWidth(ctx, text);
       if (!free(p[0], p[1] - 8, w, 16) || hidden(b.x + b.w * 0.02, b.y + b.h * 0.02, top)) continue;
       take(p[0], p[1] - 8, w, 16);
-      env.haloText(ctx, text, p[0], p[1], th.ink, th);
+      env.haloText(ctx, text, p[0], p[1], C.faint?.(b.id) ? th.ink3 : th.ink, th);
     }
     // Ghost labels for deleted and new files.
     for (const g of C.lay.ghosts) {

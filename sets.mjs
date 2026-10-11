@@ -792,10 +792,12 @@ export function measure(ctx, paint, id) {
   return 0;
 }
 
-// Does a class match a legend pick? Keys match themselves and nested keys;
-// ranges match numbers inside [lo, hi].
+// Does a class match a legend pick? A key (or any of keys) matches itself and
+// nested keys; ranges match numbers inside [lo, hi].
 export function classMatches(cls, pick) {
-  if (pick.key != null) return typeof cls === 'string' && (cls === pick.key || cls.startsWith(pick.key + '/'));
+  const under = (k) => cls === k || cls.startsWith(k + '/');
+  if (pick.keys) return typeof cls === 'string' && pick.keys.some(under);
+  if (pick.key != null) return typeof cls === 'string' && under(pick.key);
   return typeof cls === 'number' && cls >= pick.lo && cls <= pick.hi;
 }
 

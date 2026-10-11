@@ -193,6 +193,10 @@ describe('sets', () => {
     assert.equal(classify(ctx, 'lang', id('web/src')), 'dir');
     assert.ok(classMatches(classify(ctx, 'lang', id('web/src/cart.ts#Cart.pay')), { key: 'lang:ts' }));
     assert.ok(!classMatches('lang:tsx', { key: 'lang:ts' }));
+    assert.ok(classMatches('rev:some', { keys: ['rev:none', 'rev:some'] }));
+    assert.ok(classMatches('lang:py/func', { keys: ['lang:go', 'lang:py'] }));
+    assert.ok(!classMatches('rev:ok', { keys: ['rev:none', 'rev:some'] }));
+    assert.ok(!classMatches(3, { keys: ['sev:3'] }));
     assert.equal(classify(ctx, 'issues', id('web/src/api.ts')), 'sev:3');
     assert.equal(classify(ctx, 'review', id('web/src/api.ts')), 'rev:none');
     assert.equal(classify(ctx, 'stage', id('web/src/api.ts#post')), 'stage:edit');

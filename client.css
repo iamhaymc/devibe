@@ -733,7 +733,8 @@ textarea:focus, input:focus { border-color: var(--accent); }
 }
 #foot > * { pointer-events: auto; display: flex; align-items: center; gap: 12px; padding: 0 12px; font-size: 12px; color: var(--ink-2); min-width: 0; }
 #foot > *:empty { display: none; }
-.legend { overflow-x: auto; overflow-y: visible; white-space: nowrap; scrollbar-width: none; }
+.legend { flex: 0 1 auto; overflow-x: auto; white-space: nowrap; scrollbar-width: none; }
+.legend.more { -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(90deg, #000 calc(100% - 28px), transparent); }
 .legend::-webkit-scrollbar { display: none; }
 .legend .key { display: inline-flex; gap: 5px; align-items: center; border: 0; background: none; padding: 2px 4px; margin: 0 -4px; border-radius: 5px; font: inherit; color: inherit; white-space: nowrap; }
 .legend button.key:hover { background: var(--hover); color: var(--ink); }
@@ -743,11 +744,10 @@ textarea:focus, input:focus { border-color: var(--accent); }
 .legend .ramp-wrap { position: relative; display: inline-flex; align-items: center; }
 .legend .ramp { cursor: crosshair; touch-action: none; }
 .legend .band { position: absolute; top: -3px; height: 14px; border: 1.5px solid var(--ink); border-radius: 3px; pointer-events: none; }
-.legend .brush-label { position: absolute; bottom: 22px; left: 0; padding: 3px 7px; border-radius: 6px; background: var(--surface); border: 1px solid var(--edge); color: var(--ink); white-space: nowrap; font-size: 11.5px; box-shadow: var(--shadow); }
 .legend .sw { width: 9px; height: 9px; border-radius: 2px; flex: none; }
 .legend .ramp { width: 90px; height: 8px; border-radius: 4px; }
 .legend .title { color: var(--ink); font-weight: 550; }
-.status { white-space: nowrap; overflow: hidden; }
+.status { flex: none; white-space: nowrap; overflow: hidden; }
 .status .live { width: 7px; height: 7px; border-radius: 50%; background: var(--good); }
 .status .live.off { background: var(--critical); }
 .status .bar { width: 90px; height: 4px; border-radius: 4px; background: var(--raise); overflow: hidden; }
@@ -768,6 +768,8 @@ textarea:focus, input:focus { border-color: var(--accent); }
 .tip .muted { word-break: break-all; }
 .tip .nums { display: flex; gap: 10px; margin-top: 4px; color: var(--ink-2); flex-wrap: wrap; }
 .toasts { position: fixed; top: calc(var(--bar-h) + var(--gap) * 2); left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 6px; z-index: 40; pointer-events: none; }
+/* The Code sheet's header sits where toasts go: show them at the bottom instead. */
+@media (min-width: 761px) { body:has(#code:not([hidden])) .toasts { top: auto; bottom: calc(var(--foot-h) + var(--gap) * 3); } }
 .toast { padding: 8px 14px; font-size: 12.5px; display: flex; gap: 8px; align-items: center; animation: rise 0.2s ease-out; }
 .toast.error { border-color: var(--critical); }
 @keyframes rise { from { transform: translateY(-6px); opacity: 0; } }
