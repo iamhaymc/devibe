@@ -12,6 +12,9 @@ import crypto from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
+import { index, liftTo, isUnder, walk, boundary, linkIndices, strongGroups, STATIC as STATIC_KINDS } from './sets.mjs';
+
+export { strongGroups };
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const posix = path.posix;
@@ -896,12 +899,15 @@ export const RULES = [
   { id: 'dead', name: 'Commented-out code', about: 'Code that was turned into comments instead of removed.' },
   { id: 'naming', name: 'Mixed naming', about: 'Function names that break the style most of the language uses here.' },
   { id: 'lone', name: 'Unlinked files', about: 'Code files with no links in or out.' },
+  { id: 'couple', name: 'Hidden coupling', about: 'Files that keep changing in the same commits, though nothing links them.', mid: 5, ratio: 0.5 },
   { id: 'empty', name: 'Empty files', about: 'Files with no content.' },
   { id: 'wide', name: 'Long lines', about: 'Lines over 160 characters.' },
   { id: 'crowd', name: 'Crowded folders', about: 'Folders with many files side by side.', mid: 30 },
 ];
 const RULE = Object.fromEntries(RULES.map((r) => [r.id, r]));
-export const LINK_KINDS = ['import', 'call', 'use', 'base', 'copy'];
+// `change` (changes with) is appended so the indexes of the others never move.
+export const LINK_KINDS = ['import', 'call', 'use', 'base', 'copy', 'change'];
+const SITE_CAP = 12;
 const ENTRY_NAMES = new Set(['main', 'Main', 'index', 'program', 'Program', 'app', 'App', 'server', 'cli', 'setup', 'manage', 'conftest', '__init__', '__main__', 'lib', 'mod', 'build', 'vite.config', 'webpack.config', 'Startup']);
 const ENTRY_FUNCS = new Set(['main', 'Main', 'constructor', 'init', '__init__', 'setUp', 'tearDown', 'toString', 'ToString', 'Equals', 'GetHashCode', 'Dispose', 'render', 'handler', 'default', 'Configure', 'ConfigureServices', 'OnGet', 'OnPost', 'componentDidMount', 'ngOnInit', 'setup', 'run', 'execute', 'Execute', 'invoke', 'Invoke', 'call', 'drop', 'fmt', 'new', 'from', 'into', 'deref', 'clone', 'eq', 'hash', 'String', 'Error', 'ServeHTTP', 'init']);
 const VERSION_RE = /(?:^|[\s._-])(?:v\d+|new|old|copy|backup|bak|orig|final|tmp|temp|fixed|draft|working|updated|improved|enhanced|refactored|alt)$|\(\d+\)$|\bcopy(?: \d+)?$/i;
@@ -914,7 +920,9 @@ function levelOf(rule, value) {
 
 // ───────────────────────────── Model ─────────────────────────────
 // One flat node list: root → repos → dirs → files → symbols. Links are
-// [from, to, kind, weight] between node ids. Issues point at node ids.
+// [from, to, kind, weight] between node ids. Issues point at node ids. Link
+// sites (the source lines of each link) ride along as a non-enumerable
+// `sites` map, so they never go out with `repo.model`.
 
 export function buildModel(repos, { ledgers = new Map(), stage = null, preview = false } = {}) {
   const nodes = [];
@@ -922,6 +930,7 @@ export function buildModel(repos, { ledgers = new Map(), stage = null, preview =
   add({ kind: 'root', name: 'workspace', up: -1, key: '', lines: 0 });
   const files = [];
   const fileOf = [];
+  const fileIds = new Map();
   for (const repo of repos) {
     const rid = add({ kind: 'repo', name: repo.name, up: 0, key: repo.name, path: '', root: repo.root, branch: repo.git?.branch ?? null, lines: 0 });
     fileOf[rid] = -1;
@@ -948,6 +957,7 @@ export function buildModel(repos, { ledgers = new Map(), stage = null, preview =
         dirty: repo.git?.dirty.has(rel) || undefined, staged: staged ? staged.state : undefined,
       });
       fileOf[fid] = fid;
+      fileIds.set(fkey, fid);
       const rec = { id: fid, repo, f, syms: [], owner: null, imports: new Set(), ext: new Set() };
       const counts = new Map();
       for (const s of f.syms) {
@@ -974,10 +984,15 @@ export function buildModel(repos, { ledgers = new Map(), stage = null, preview =
   }
 
   const links = new Map();
-  const link = (s, t, kind, w = 1) => {
+  const sites = new Map();
+  const link = (s, t, kind, w = 1, line = 0) => {
     if (s === t || s < 0 || t < 0) return;
     const key = `${s},${t},${kind}`;
     links.set(key, (links.get(key) ?? 0) + w);
+    if (!line) return;
+    let list = sites.get(key);
+    if (!list) sites.set(key, (list = []));
+    if (list.length < SITE_CAP && !list.includes(line)) list.push(line);
   };
   const isUnder = (child, anc) => { for (let p = child; p >= 0; p = nodes[p].up) if (p === anc) return true; return false; };
 
@@ -990,7 +1005,7 @@ export function buildModel(repos, { ledgers = new Map(), stage = null, preview =
         if (!imp.spec.startsWith('.') && !imp.mod) rec.ext.add(extName(imp.spec, rec.f.lang));
         continue;
       }
-      for (const t of hits) if (t.id !== rec.id) { rec.imports.add(t.id); link(rec.id, t.id, 'import'); }
+      for (const t of hits) if (t.id !== rec.id) { rec.imports.add(t.id); link(rec.id, t.id, 'import', 1, imp.line); }
     }
     if (rec.ext.size) nodes[rec.id].ext = [...rec.ext].slice(0, 40);
   }
@@ -1036,7 +1051,7 @@ export function buildModel(repos, { ledgers = new Map(), stage = null, preview =
         for (const t of pick(rec, targets, false)) {
           if (t === src || isUnder(src, t) || isUnder(t, src)) continue;
           if (fileOf[t] === rec.id && nodes[t].from === line) continue;
-          link(src, t, nodes[t].kind === 'func' ? 'call' : 'use');
+          link(src, t, nodes[t].kind === 'func' ? 'call' : 'use', 1, line);
         }
       }
     }
@@ -1046,7 +1061,7 @@ export function buildModel(repos, { ledgers = new Map(), stage = null, preview =
     for (const sid of rec.syms) {
       for (const b of nodes[sid].bases ?? []) {
         const cands = (decls.get(b) ?? []).filter((t) => nodes[t].kind === 'type' && t !== sid);
-        for (const t of pick(rec, cands, true)) link(sid, t, 'base');
+        for (const t of pick(rec, cands, true)) link(sid, t, 'base', 1, nodes[sid].from);
       }
     }
   }
@@ -1070,6 +1085,8 @@ export function buildModel(repos, { ledgers = new Map(), stage = null, preview =
     spot(a, c.fromA, c.size, sb, c.fromB);
     spot(b, c.fromB, c.size, sa, c.fromA);
     link(sa, sb, 'copy', c.size);
+    // A copy's sites are the block's first line in the source, then in the target.
+    if (sa !== sb && !sites.has(`${sa},${sb},copy`)) sites.set(`${sa},${sb},copy`, [c.fromA, c.fromB]);
   }
   for (const s of spots.values()) {
     const first = s.others.values().next().value;
@@ -1142,7 +1159,7 @@ export function buildModel(repos, { ledgers = new Map(), stage = null, preview =
       if (!fileGraph.has(a)) fileGraph.set(a, new Set());
       fileGraph.get(a).add(b);
     }
-    if (kind !== 'copy') {
+    if (STATIC_KINDS.has(kind)) {
       const da = dirOfNode(a), db = dirOfNode(b);
       if (da >= 0 && db >= 0 && da !== db && !isUnder(da, db) && !isUnder(db, da)) {
         if (!dirGraph.has(da)) dirGraph.set(da, new Set());
@@ -1161,16 +1178,45 @@ export function buildModel(repos, { ledgers = new Map(), stage = null, preview =
 
   // Unlinked files
   const touched = new Set();
+  const fileLinked = new Set();
   for (const [key] of links) {
     const [s, t, kind] = key.split(',');
-    if (kind === 'copy') continue;
-    touched.add(fileOf[+s]); touched.add(fileOf[+t]);
+    if (!STATIC_KINDS.has(kind)) continue;
+    const a = fileOf[+s], b = fileOf[+t];
+    touched.add(a); touched.add(b);
+    if (a !== b) fileLinked.add(`${Math.min(a, b)},${Math.max(a, b)}`);
   }
   for (const rec of files) {
     const n = nodes[rec.id];
     const stem = n.name.replace(/\.[^.]+$/, '');
     if (touched.has(rec.id) || rec.f.gen || rec.f.test || rec.f.empty || LANG[rec.f.lang]?.data || ['html', 'css', 'sh', 'sql'].includes(rec.f.lang) || ENTRY_NAMES.has(stem)) continue;
     flag('lone', rec.id, 1, 'No imports, uses, or calls in or out', 'low');
+  }
+
+  // Changes-with links (undirected, lower id first) and hidden coupling: files
+  // that keep changing in the same commits while nothing links them.
+  const coupled = new Map();
+  for (const repo of repos) {
+    for (const [ra, rb, count] of repo.git?.pairs ?? []) {
+      const fa = fileIds.get(`${repo.name}/${ra}`), fb = fileIds.get(`${repo.name}/${rb}`);
+      if (fa == null || fb == null || fa === fb) continue;
+      const a = Math.min(fa, fb), b = Math.max(fa, fb);
+      link(a, b, 'change', count);
+      const ca = nodes[a].churn || count, cb = nodes[b].churn || count;
+      if (count < RULE.couple.mid || count / Math.min(ca, cb) < RULE.couple.ratio || fileLinked.has(`${a},${b}`)) continue;
+      const skip = (n) => n.test || n.gen || LANG[n.lang]?.data;
+      if (skip(nodes[a]) || skip(nodes[b])) continue;
+      for (const [x, y] of [[a, b], [b, a]]) {
+        if (!coupled.has(x)) coupled.set(x, []);
+        coupled.get(x).push([y, count]);
+      }
+    }
+  }
+  for (const [x, list] of coupled) {
+    list.sort((p, q) => q[1] - p[1]);
+    const [y, count] = list[0];
+    const more = list.length - 1;
+    flag('couple', x, 1, `Changes with ${nodes[y].path} in ${count} of ${nodes[x].churn || count} commits, but nothing links them${more ? ` (+${more} more file${more > 1 ? 's' : ''})` : ''}.`, 'low');
   }
 
   // Ledger: reviews and waived issues
@@ -1195,7 +1241,7 @@ export function buildModel(repos, { ledgers = new Map(), stage = null, preview =
   }
   const langs = {};
   for (const rec of files) langs[rec.f.lang] = (langs[rec.f.lang] ?? 0) + rec.f.lines;
-  return {
+  const model = {
     nodes, links: linkList, issues, marks, preview: !!preview,
     rules: RULES.map(({ id, name, about }) => ({ id, name, about })),
     linkKinds: LINK_KINDS,
@@ -1203,6 +1249,8 @@ export function buildModel(repos, { ledgers = new Map(), stage = null, preview =
     stats: { files: files.length, lines: nodes[0].lines, symbols: nodes.length - files.length, links: linkList.length, issues: issues.length },
     made: Date.now(),
   };
+  Object.defineProperty(model, 'sites', { value: sites, enumerable: false });
+  return model;
 }
 
 function timeOf(repo, rel, f) {
@@ -1229,38 +1277,6 @@ function styleOf(name, lang) {
 export function rangeHash(text, from, to) {
   if (!from) return sha1(text);
   return sha1(text.split('\n').slice(from - 1, to).join('\n'));
-}
-
-// Tarjan's strongly connected components; returns groups of size > 1.
-export function strongGroups(graph) {
-  let index = 0;
-  const idx = new Map(), low = new Map(), on = new Set(), stack = [], out = [];
-  const visit = (v) => {
-    const work = [[v, [...(graph.get(v) ?? [])], 0]];
-    idx.set(v, index); low.set(v, index); index++; stack.push(v); on.add(v);
-    while (work.length) {
-      const top = work.at(-1);
-      const [node, next] = top;
-      if (top[2] < next.length) {
-        const w = next[top[2]++];
-        if (!idx.has(w)) {
-          idx.set(w, index); low.set(w, index); index++; stack.push(w); on.add(w);
-          work.push([w, [...(graph.get(w) ?? [])], 0]);
-        } else if (on.has(w)) low.set(node, Math.min(low.get(node), idx.get(w)));
-      } else {
-        work.pop();
-        if (work.length) { const parent = work.at(-1)[0]; low.set(parent, Math.min(low.get(parent), low.get(node))); }
-        if (low.get(node) === idx.get(node)) {
-          const group = [];
-          let w;
-          do { w = stack.pop(); on.delete(w); group.push(w); } while (w !== node);
-          if (group.length > 1) out.push(group.reverse());
-        }
-      }
-    }
-  };
-  for (const v of graph.keys()) if (!idx.has(v)) visit(v);
-  return out;
 }
 
 function viewFacts(repo, stage, preview) {
@@ -1536,24 +1552,40 @@ function backtrack(trace, last, a, b, off, dEnd) {
   return ops.reverse();
 }
 
+// Group ops into hunks with context. Each hunk also carries the op index
+// range [i0, i1) it covers, so a single hunk can be reverted.
 export function makeHunks(ops, context = 3) {
   const hunks = [];
   let cur = null, lastChange = -Infinity;
+  const put = (k) => { if (!cur.idx.includes(k)) cur.idx.push(k); };
   ops.forEach((op, i) => {
     if (op.t !== ' ') {
       if (!cur || i - lastChange > context * 2) {
-        cur = { lines: [] };
+        cur = { idx: [] };
         hunks.push(cur);
-        for (let k = Math.max(0, i - context); k < i; k++) if (!cur.lines.includes(ops[k])) cur.lines.push(ops[k]);
-      } else for (let k = lastChange + 1; k < i; k++) cur.lines.push(ops[k]);
-      cur.lines.push(op);
+        for (let k = Math.max(0, i - context); k < i; k++) put(k);
+      } else for (let k = lastChange + 1; k < i; k++) put(k);
+      put(i);
       lastChange = i;
     } else if (cur && i - lastChange <= context) {
       const nextChange = ops.findIndex((o, k) => k > i && o.t !== ' ');
-      if (nextChange < 0 || nextChange - lastChange > context * 2) cur.lines.push(op);
+      if (nextChange < 0 || nextChange - lastChange > context * 2) put(i);
     }
   });
-  return hunks.map((h) => ({ a: h.lines.find((l) => l.a)?.a ?? 0, b: h.lines.find((l) => l.b)?.b ?? 0, lines: h.lines.map((l) => [l.t, l.a, l.b, l.text]) }));
+  return hunks.map((h) => {
+    const lines = h.idx.map((k) => ops[k]);
+    return { a: lines.find((l) => l.a)?.a ?? 0, b: lines.find((l) => l.b)?.b ?? 0, i0: h.idx[0], i1: h.idx.at(-1) + 1, lines: lines.map((l) => [l.t, l.a, l.b, l.text]) };
+  });
+}
+
+// The lines a symbol occupies, widened to its attached attributes,
+// decorators, and doc comments, plus one trailing blank line when the symbol
+// sits between blank lines. Returns 0-based [a, b).
+export function symbolSpan(lines, from, to) {
+  let a = from - 1, b = to;
+  while (a > 0 && /^\s*(?:@|\[[A-Z]|\/\/|\/\*\*|\*|#\[)/.test(lines[a - 1])) a--;
+  if (!lines[b]?.trim() && a > 0 && !lines[a - 1]?.trim()) b++;
+  return [a, b];
 }
 
 // ───────────────────────────── Stage ─────────────────────────────
@@ -1582,6 +1614,38 @@ export class Stage {
     if (item.after === item.before) this.items.delete(k);
   }
   remove(key) { this.write(key, null); }
+  // Replace lines from..to (1-based, inclusive) with `text`. from = to + 1
+  // inserts without removing.
+  editRange(key, from, to, text) {
+    const k = this.space.locate(key).key;
+    const cur = this.read(k);
+    if (cur == null) throw new Error(`No such file: ${key}`);
+    const lines = cur === '' ? [] : cur.split('\n');
+    const count = cur === '' ? 0 : cur.endsWith('\n') ? lines.length - 1 : lines.length;
+    if (!Number.isInteger(from) || !Number.isInteger(to) || from < 1 || from > count + 1 || to < from - 1 || to > count) throw new Error(`Lines ${from}–${to} are outside ${k} (1–${count}).`);
+    const repl = text === '' ? [] : String(text).replace(/\n$/, '').split('\n');
+    lines.splice(from - 1, to - from + 1, ...repl);
+    this.write(k, lines.join('\n'));
+    return k;
+  }
+  // Undo one hunk of a staged edit. New and deleted files have one hunk:
+  // reverting it drops the item.
+  revertHunk(key, index) {
+    const k = this.space.locate(key).key;
+    const it = this.items.get(k);
+    if (!it) throw new Error(`${k} is not staged.`);
+    if (it.before == null || it.after == null) { this.items.delete(k); return k; }
+    const ops = diffLines(it.before, it.after);
+    const h = makeHunks(ops)[index];
+    if (!h) throw new Error(`No hunk ${index + 1} in ${k}.`);
+    const out = [];
+    ops.forEach((op, i) => {
+      const inside = i >= h.i0 && i < h.i1;
+      if (op.t === ' ' || (op.t === '-' && inside) || (op.t === '+' && !inside)) out.push(op.text);
+    });
+    this.write(k, out.join('\n'));
+    return k;
+  }
   move(from, to) {
     const text = this.read(from);
     if (text == null) throw new Error(`No such file: ${from}`);
@@ -1703,17 +1767,36 @@ async function readGit(root) {
   const prefix = (await run('git', ['rev-parse', '--show-prefix'], root))?.trim() ?? '';
   const log = (await run('git', ['log', '-n', '3000', '--no-merges', '--format=%x01%at', '--name-only', '--', '.'], root)) ?? '';
   const files = new Map();
+  const together = new Map();
   for (const chunk of log.split('\x01')) {
     const lines = chunk.split('\n').filter(Boolean);
     if (!lines.length) continue;
     const time = +lines[0];
+    const rels = [];
     for (const p of lines.slice(1)) {
       if (!p.startsWith(prefix)) continue;
       const rel = p.slice(prefix.length);
+      rels.push(rel);
       const f = files.get(rel);
       if (f) { f.churn++; f.time = Math.max(f.time, time); } else files.set(rel, { churn: 1, time });
     }
+    // Commits that touch many files are formatting, renames, or merges: skip them.
+    if (rels.length < 2 || rels.length > 24) continue;
+    const list = [...new Set(rels)].sort();
+    for (let i = 0; i < list.length; i++) for (let j = i + 1; j < list.length; j++) {
+      const key = list[i] + '\0' + list[j];
+      together.set(key, (together.get(key) ?? 0) + 1);
+    }
   }
+  // Pairs that change together often enough to mean something.
+  const pairs = [];
+  for (const [key, count] of together) {
+    if (count < 3) continue;
+    const [a, b] = key.split('\0');
+    if (count / Math.min(files.get(a).churn, files.get(b).churn) >= 0.35) pairs.push([a, b, count]);
+  }
+  pairs.sort((p, q) => q[2] - p[2]);
+  pairs.length = Math.min(pairs.length, 4000);
   const status = (await run('git', ['status', '--porcelain', '-z', '--untracked-files=all', '--', '.'], root)) ?? '';
   const dirty = new Set();
   const parts = status.split('\0');
@@ -1724,7 +1807,7 @@ async function readGit(root) {
     if (p[0] === 'R' || p[0] === 'C') i++;
     dirty.add(rel.startsWith(prefix) ? rel.slice(prefix.length) : rel);
   }
-  return { branch, files, dirty };
+  return { branch, files, dirty, pairs };
 }
 
 async function pool(list, size, fn) {
@@ -1897,6 +1980,12 @@ export class Workspace {
     this.agent.abort?.abort();
   }
 
+  node(key) {
+    if (!this.model) return null;
+    const id = index(this.model).byKey.get(key);
+    return id == null ? null : this.model.nodes[id];
+  }
+
   locate(key) {
     const clean = String(key).replace(/^\/+/, '').split('#')[0];
     let repo = this.repos.find((r) => clean === r.name || clean.startsWith(r.name + '/'));
@@ -1973,7 +2062,7 @@ export class Workspace {
   // Mechanical edits (no agent): rename a symbol, move or delete files and symbols.
   renameSymbol(key, name) {
     if (!/^[A-Za-z_$][\w$]*$/.test(name)) throw new Error('Use a plain identifier.');
-    const node = this.model.nodes.find((n) => n.key === key);
+    const node = this.node(key);
     if (!node || !['type', 'func', 'space'].includes(node.kind)) throw new Error('Pick a type or function to rename.');
     const old = node.name.split('::').pop();
     const re = new RegExp(`(?<![\\w$])${old.replace(/[$]/g, '\\$')}(?![\\w$])`, 'g');
@@ -2000,8 +2089,8 @@ export class Workspace {
   }
 
   moveFile(key, toDir) {
-    const node = this.model.nodes.find((n) => n.key === key);
-    const target = this.model.nodes.find((n) => n.key === toDir);
+    const node = this.node(key);
+    const target = this.node(toDir);
     if (!node || !target || !['dir', 'repo'].includes(target.kind)) throw new Error('Drop onto a folder.');
     const fromRepo = this.locate(key).repo, toRepo = target.kind === 'repo' ? this.repos.find((r) => r.name === target.name) : this.locate(target.key).repo;
     const files = node.kind === 'file' ? [node] : this.model.nodes.filter((n) => n.kind === 'file' && n.key.startsWith(node.key + '/'));
@@ -2022,7 +2111,7 @@ export class Workspace {
     let count = 0;
     const byFile = new Map();
     for (const key of keys) {
-      const node = this.model.nodes.find((n) => n.key === key);
+      const node = this.node(key);
       if (!node) continue;
       if (node.kind === 'file') { this.stage.remove(key); count++; }
       else if (node.kind === 'dir') { for (const f of this.model.nodes) if (f.kind === 'file' && f.key.startsWith(key + '/')) { this.stage.remove(f.key); count++; } }
@@ -2038,15 +2127,105 @@ export class Workspace {
       const lines = text.split('\n');
       ranges.sort((a, b) => b[0] - a[0]);
       for (const [from, to] of ranges) {
-        let a = from - 1, b = to;
-        while (a > 0 && /^\s*(?:@|\[[A-Z]|\/\/\/|\/\*\*|\*|#\[)/.test(lines[a - 1])) a--;
-        if (!lines[b]?.trim() && a > 0 && !lines[a - 1]?.trim()) b++;
+        const [a, b] = symbolSpan(lines, from, to);
         lines.splice(a, b - a);
         count++;
       }
       this.stage.write(fk, lines.join('\n'));
     }
     return count;
+  }
+
+  // Move a type or function to the end of another file. Its attributes,
+  // decorators, and doc comments go with it. Both files are staged.
+  moveSymbol(key, toFile) {
+    const node = this.node(key);
+    const target = this.node(toFile);
+    if (!node || !node.from || !['type', 'func', 'space', 'part'].includes(node.kind)) throw new Error('Pick a type or function to move.');
+    if (!target || target.kind !== 'file') throw new Error('Drop onto a file.');
+    const from = key.split('#')[0];
+    if (from === target.key) throw new Error(`${node.name} is already in ${target.name}.`);
+    const text = this.stage.read(from);
+    const dest = this.stage.read(target.key);
+    if (text == null || dest == null) throw new Error('That file is gone or staged for delete.');
+    const lines = text.split('\n');
+    const [a, b] = symbolSpan(lines, node.from, node.to);
+    const cut = lines.slice(a, b);
+    while (cut.length && !cut.at(-1).trim()) cut.pop();
+    lines.splice(a, b - a);
+    this.stage.write(from, lines.join('\n'));
+    const body = dest.replace(/\s+$/, '');
+    this.stage.write(target.key, (body ? body + '\n\n' : '') + cut.join('\n') + '\n');
+    return { from, to: target.key, name: node.name };
+  }
+
+  // Lines in a file that are link sites (out), and lines elsewhere that link
+  // into the file (in). Changes-with links have no lines.
+  fileLinks(key) {
+    const m = this.model;
+    const I = index(m);
+    const f = I.byKey.get(key);
+    if (f == null || m.nodes[f].kind !== 'file') throw new Error(`No such file: ${key}`);
+    const out = [], inn = [];
+    const lines = (s, t, kind) => { const list = m.sites.get(`${s},${t},${kind}`) ?? []; return kind === 'copy' ? list.slice(0, 1) : list; };
+    walk(I, f, (x) => {
+      for (const li of I.out[x]) {
+        const [s, t, k] = m.links[li];
+        const kind = m.linkKinds[k];
+        if (kind === 'change') continue;
+        for (const line of lines(s, t, kind)) if (out.length < 2000) out.push({ line, from: m.nodes[s].key, to: m.nodes[t].key, kind });
+      }
+      for (const li of I.inn[x]) {
+        const [s, t, k] = m.links[li];
+        const kind = m.linkKinds[k];
+        if (kind === 'change' || isUnder(I, s, t)) continue;
+        for (const line of lines(s, t, kind)) if (inn.length < 2000) inn.push({ from: m.nodes[s].key, line, kind, to: m.nodes[t].key });
+      }
+    });
+    return { key, out, in: inn };
+  }
+
+  // Saved sets live in the ledger of the repo that holds their first member.
+  setsState() {
+    const sets = [];
+    for (const repo of this.repos) for (const [id, s] of Object.entries(this.ledgers.get(repo.name)?.sets ?? {})) sets.push({ id, repo: repo.name, ...s });
+    return { sets: sets.sort((a, b) => b.at - a.at) };
+  }
+
+  saveSet(set) {
+    const strs = (list, n) => (Array.isArray(list) ? list : []).filter((x) => typeof x === 'string').slice(0, n);
+    const nodes = strs(set?.nodes, 5000);
+    const links = (Array.isArray(set?.links) ? set.links : []).filter((l) => Array.isArray(l) && l.length === 3 && l.every((x) => typeof x === 'string')).slice(0, 5000);
+    const ranges = (Array.isArray(set?.ranges) ? set.ranges : []).filter((r) => Array.isArray(r) && typeof r[0] === 'string' && Number.isInteger(r[1]) && Number.isInteger(r[2])).slice(0, 5000);
+    const first = nodes[0] ?? links[0]?.[0] ?? ranges[0]?.[0];
+    if (!first) throw new Error('The set is empty.');
+    const repo = this.repoFor(first);
+    const led = this.ledgers.get(repo.name);
+    led.sets ??= {};
+    let id = typeof set.id === 'string' && /^[\w-]{1,40}$/.test(set.id) ? set.id : null;
+    for (const r of this.repos) {
+      const other = this.ledgers.get(r.name);
+      if (id && r !== repo && other.sets?.[id]) { delete other.sets[id]; saveLedger(this.home, r.root, other); }
+    }
+    if (!id || !led.sets[id]) {
+      if (Object.keys(led.sets).length >= 200) throw new Error(`${repo.name} already has 200 saved sets. Remove one first.`);
+      id ??= crypto.randomBytes(6).toString('hex');
+    }
+    const name = String(set.name ?? '').trim().slice(0, 80) || 'Untitled set';
+    led.sets[id] = { name, nodes, links, ranges, recipe: Array.isArray(set.recipe) ? set.recipe.slice(0, 20) : null, at: Date.now() };
+    saveLedger(this.home, repo.root, led);
+    this.emit('sets.state', this.setsState());
+    return id;
+  }
+
+  dropSet(id) {
+    for (const repo of this.repos) {
+      const led = this.ledgers.get(repo.name);
+      if (!led.sets?.[id]) continue;
+      delete led.sets[id];
+      saveLedger(this.home, repo.root, led);
+    }
+    this.emit('sets.state', this.setsState());
   }
 
   repoFor(key) {
@@ -2060,7 +2239,7 @@ export class Workspace {
     for (const key of keys) {
       const repo = this.repoFor(key);
       const led = this.ledgers.get(repo.name);
-      const node = nodes.find((n) => n.key === key);
+      const node = this.node(key);
       const targets = node && (node.kind === 'dir' || node.kind === 'repo') ? nodes.filter((f) => f.kind === 'file' && f.key.startsWith(key + '/')) : [node ?? { key }];
       for (const t of targets) {
         if (!on) { delete led.marks[t.key]; continue; }
@@ -2107,28 +2286,192 @@ function brief(space) {
     '- Read before you write. Never guess file contents. Use show_outline and find_refs to see structure.',
     '- Your edits are staged, not saved. The user reviews and applies them. Never claim they are applied.',
     '- Make the smallest change that fully does the task. Keep the existing style and naming.',
-    '- When you move or rename something, update every reference. Check with find_refs and find_text.',
+    '- When you move or rename something, update every reference. Check with find_refs, show_links, and find_text.',
+    '- show_links lists what a part uses and what uses it, with the lines where it happens.',
     '- When asked to explain, answer in plain, direct words and do not edit.',
     '- Finish with a short summary of what changed and why, as a bullet list.',
     space.config.style ? `The user\'s style guide (always follow it):\n${space.config.style}` : '',
   ].filter(Boolean).join('\n');
 }
 
-function focusText(space, focus) {
-  if (!focus?.length || !space.model) return '';
-  const byKey = new Map(space.model.nodes.map((n) => [n.key, n]));
-  const lines = [];
-  for (const key of focus.slice(0, 40)) {
-    const n = byKey.get(key);
-    if (!n) continue;
-    const where = n.from ? `${key.split('#')[0]}:${n.from}-${n.to}` : key;
-    lines.push(`- ${n.kind}${n.form ? ' ' + n.form : ''} ${n.name} at ${where}`);
-    for (const i of space.model.issues) if (i.node === n.id && !i.waived) lines.push(`  issue: ${RULE[i.rule]?.name ?? i.rule}: ${i.note} (line ${i.line})`);
-  }
-  return lines.length ? `\n\nFocus (selected in the map):\n${lines.join('\n')}` : '';
+// Agent actions. The Act bar shows them; the prompts live here, next to the
+// rules, so they can be tested. `takes` says what a set needs for the action
+// to apply (see the Act bar in DESIGN.md).
+export const ACTS = [
+  { id: 'explain', name: 'Explain', edits: false, takes: 'any', about: 'What it does, how it connects, what is risky. No edits.', prompt: 'Explain what the selection does and how its parts work together. Use the connections listed below: say how it depends on the rest and what depends on it. Point out anything surprising, risky, or unused. Do not edit.' },
+  { id: 'tidy', name: 'Tidy', edits: true, takes: 'code', about: 'Clearer names, simpler logic, no leftovers. Same behavior.', prompt: 'Tidy the selection: clearer names, simpler logic, no dead code or leftovers. Keep behavior and the interface listed below the same.' },
+  { id: 'split', name: 'Split', edits: true, takes: 'one', about: 'Smaller, well-named parts, each where it belongs.', prompt: 'Split the selection into smaller, well-named parts. Put each part where it belongs. Update every reference listed below.' },
+  { id: 'fix', name: 'Fix findings', edits: true, takes: 'issues', about: 'Fix the open findings in the selection.', prompt: 'Fix the findings listed for the selection. Keep behavior the same.' },
+  { id: 'tests', name: 'Add tests', edits: true, takes: 'code', about: 'Focused unit tests in the repo’s test style.', prompt: 'Add focused unit tests for the selection, in the test style this repo already uses. Cover the interface listed below.' },
+  { id: 'docs', name: 'Document', edits: true, takes: 'code', about: 'Short doc comments on the public parts.', prompt: 'Add short doc comments to the public parts of the selection. Plain words, no filler.' },
+  { id: 'decouple', name: 'Decouple', edits: true, takes: 'link', about: 'Remove the selected dependency without changing behavior.', prompt: 'Remove the dependency in the selected links without changing behavior: pass it in, put it behind a small interface, or move the shared part where both sides can use it. Update every call site listed.' },
+  { id: 'merge', name: 'Merge copies', edits: true, takes: 'copy', about: 'Replace copied code with one shared part.', prompt: 'The selected places hold copied code. Replace the copies with one shared function or type in the best place and use it from each place. Keep behavior the same.' },
+  { id: 'extract', name: 'Extract', edits: true, takes: 'group', about: 'Move the parts into one new folder or module.', prompt: 'Move the selected parts into one new, well-named folder or module. Expose only what the rest of the code uses (the "used from outside" list). Update every import and reference.' },
+];
+const ACT = Object.fromEntries(ACTS.map((a) => [a.id, a]));
+const KIND_WORD = { import: 'import', call: 'call', use: 'use', base: 'extends', copy: 'copy', change: 'changes with' };
+
+// A short, qualified name: Cart.total, api.post, web/src/cart.ts, web/src/.
+function partName(m, I, id) {
+  const n = m.nodes[id];
+  if (n.kind === 'file') return n.path;
+  if (n.kind === 'dir') return `${n.path || n.name}/`;
+  if (n.kind === 'repo' || n.kind === 'root') return n.name;
+  const chain = n.key.split('#')[1] ?? n.name;
+  const stem = m.nodes[I.fileOf[id]].name.replace(/\.[^.]+$/, '');
+  return chain.includes('.') || stem.toLowerCase() === chain.toLowerCase() ? chain : `${stem}.${chain}`;
 }
 
-function agentTools(space, sdk) {
+const kindsText = (m, list) => {
+  const w = new Map();
+  for (const li of list) { const [, , k, weight] = m.links[li]; const kind = KIND_WORD[m.linkKinds[k]] ?? m.linkKinds[k]; w.set(kind, (w.get(kind) ?? 0) + weight); }
+  return [...w].map(([k, n]) => (n > 1 ? `${k} ×${n}` : k)).join(', ');
+};
+
+// Where links happen: file:line, line; grouped by source file, 12 lines at most.
+function sitesText(m, I, list, full = false, cap = 12) {
+  const byFile = new Map();
+  let n = 0;
+  for (const li of list) {
+    const [s, t, k] = m.links[li];
+    const kind = m.linkKinds[k];
+    let lines = m.sites?.get(`${s},${t},${kind}`) ?? [];
+    if (kind === 'copy') lines = lines.slice(0, 1);
+    const f = m.nodes[I.fileOf[s]];
+    if (!f || !lines.length) continue;
+    const name = full ? f.key : f.name;
+    if (!byFile.has(name)) byFile.set(name, new Set());
+    for (const l of lines) { if (n >= cap) break; if (!byFile.get(name).has(l)) { byFile.get(name).add(l); n++; } }
+  }
+  return [...byFile].filter(([, set]) => set.size).map(([f, set]) => `${f}:${[...set].sort((a, b) => a - b).join(', ')}`).join('; ');
+}
+
+function scopeOf(set, focus = []) {
+  const strs = (list) => (Array.isArray(list) ? list.filter((x) => typeof x === 'string') : []);
+  return {
+    nodes: [...new Set([...strs(set?.nodes), ...strs(focus)])],
+    links: (Array.isArray(set?.links) ? set.links : []).filter((l) => Array.isArray(l) && l.length === 3 && l.every((x) => typeof x === 'string')),
+    ranges: (Array.isArray(set?.ranges) ? set.ranges : []).filter((r) => Array.isArray(r) && typeof r[0] === 'string' && Number.isInteger(r[1]) && Number.isInteger(r[2])),
+  };
+}
+
+// The prompt text for a set: its members with findings, the links inside it,
+// and its interface to the rest of the code, with call sites. Replaces the
+// old focus list; a plain `focus` array still counts as `set.nodes`.
+export function setText(space, set, { limit = 12000 } = {}) {
+  const m = space.model;
+  if (!m || !set) return '';
+  const I = index(m);
+  const scope = scopeOf(set);
+  const ids = scope.nodes.map((k) => I.byKey.get(k)).filter((id) => id != null);
+  const links = scope.links.filter((l) => I.byKey.has(l[0]) && I.byKey.has(l[1]));
+  const ranges = scope.ranges.filter((r) => I.byKey.has(r[0]));
+  if (!ids.length && !links.length && !ranges.length) return '';
+  const N = m.nodes;
+  const open = m.issues.filter((i) => !i.waived);
+  const ruleName = (id) => RULES.find((r) => r.id === id)?.name ?? id;
+  const issuesUnder = (id) => open.filter((i) => isUnder(I, i.node, id));
+  const out = [];
+  const counts = [];
+  if (ids.length) counts.push(`${ids.length} part${ids.length === 1 ? '' : 's'}`);
+  if (links.length) counts.push(`${links.length} link${links.length === 1 ? '' : 's'}`);
+  if (ranges.length) counts.push(`${ranges.length} line range${ranges.length === 1 ? '' : 's'}`);
+  out.push(`Selection (${counts.join(', ')}):`);
+  const findings = (list) => {
+    for (const i of list.slice(0, 6)) out.push(`  finding: ${ruleName(i.rule)}: ${i.note} (${N[I.fileOf[i.node]]?.path ?? N[i.node].path ?? ''}:${i.line})`);
+    if (list.length > 6) out.push(`  +${list.length - 6} more findings`);
+  };
+  for (const id of ids.slice(0, 40)) {
+    const n = N[id];
+    const facts = [`${n.lines} lines`];
+    if (n.kind === 'func') facts.push(`${n.cx ?? 0} branches`, `${n.args ?? 0} parameters`);
+    if (n.kind === 'file') facts.push(LANG[n.lang]?.name ?? n.lang);
+    if (n.kind === 'dir' || n.kind === 'repo') { let files = 0; walk(I, id, (x) => { if (N[x].kind === 'file') { files++; return false; } }); facts.unshift(`${files} file${files === 1 ? '' : 's'}`); }
+    const word = n.kind === 'dir' ? 'folder' : n.form ?? n.kind;
+    const where = n.from ? ` at ${n.key.split('#')[0]}:${n.from}-${n.to}` : '';
+    out.push(`- ${word} ${n.from ? partName(m, I, id) : n.key}${where} (${facts.join(', ')})`);
+    findings(issuesUnder(id));
+  }
+  if (ids.length > 40) {
+    const rest = new Map();
+    for (const id of ids.slice(40)) {
+      const n = N[id];
+      const word = n.kind === 'dir' ? 'folder' : n.kind === 'func' ? 'function' : n.kind;
+      const dir = N[I.fileOf[id] >= 0 ? N[I.fileOf[id]].up : n.up];
+      const key = `${word}s in ${dir?.path || dir?.name || 'the workspace'}`;
+      rest.set(key, (rest.get(key) ?? 0) + 1);
+    }
+    for (const [what, n] of rest) out.push(`- +${n} more ${what}`);
+  }
+  for (const [fk, from, to] of ranges) {
+    out.push(`- lines ${fk}:${from}-${to}`);
+    const f = I.byKey.get(fk);
+    findings(open.filter((i) => I.fileOf[i.node] === f && i.line >= from && i.line <= to));
+  }
+  for (const l of links) {
+    const list = linkIndices(I, l);
+    const [a, b] = [I.byKey.get(l[0]), I.byKey.get(l[1])];
+    const arrow = l[2] === 'change' || l[2] === 'copy' ? '↔' : '→';
+    if (!list.length) { out.push(`- link: ${partName(m, I, a)} ${arrow} ${partName(m, I, b)} (no ${l[2] === '*' ? '' : KIND_WORD[l[2]] + ' '}links found)`); continue; }
+    const where = sitesText(m, I, list, true);
+    out.push(`- link: ${partName(m, I, a)} ${arrow} ${partName(m, I, b)} (${kindsText(m, list)}${where ? `, at ${where}` : ''})`);
+  }
+  // The interface: links inside the set, what it uses, and what uses it.
+  const bound = boundary(I, { nodes: ids.map((id) => N[id].key) }, 5);
+  const uses = bound.out.map((e) => ({ name: partName(m, I, e.b), list: e.list, w: e.w }));
+  const users = bound.in.map((e) => ({ name: partName(m, I, e.a), list: e.list, w: e.w }));
+  for (const [fk, from, to] of ranges) {
+    const f = I.byKey.get(fk);
+    const inRange = (line) => line >= from && line <= to;
+    const usesR = new Map(), usersR = new Map();
+    const add = (map, id, li) => { const e = map.get(id) ?? { name: partName(m, I, id), list: [], w: 0 }; e.list.push(li); e.w += m.links[li][3]; map.set(id, e); };
+    walk(I, f, (x) => {
+      for (const li of I.out[x]) {
+        const [s, t, k] = m.links[li];
+        const lines = m.sites.get(`${s},${t},${m.linkKinds[k]}`) ?? [];
+        if (!STATIC_KINDS.has(m.linkKinds[k]) || !lines.some(inRange)) continue;
+        if (I.fileOf[t] === f && inRange(N[t].from ?? 0)) continue;
+        add(usesR, liftTo(I, t, 5), li);
+      }
+      if (x !== f && inRange(N[x].from ?? 0)) {
+        for (const li of I.inn[x]) {
+          const [s, t, k] = m.links[li];
+          if (!STATIC_KINDS.has(m.linkKinds[k]) || isUnder(I, s, x)) continue;
+          add(usersR, liftTo(I, s, 5), li);
+        }
+      }
+    });
+    uses.push(...usesR.values());
+    users.push(...usersR.values());
+  }
+  const line = (title, rows) => {
+    if (!rows.length) return;
+    const merged = new Map();
+    for (const e of rows) { const x = merged.get(e.name); if (x) { x.list.push(...e.list); x.w += e.w; } else merged.set(e.name, { ...e, list: [...e.list] }); }
+    const list = [...merged.values()].sort((p, q) => q.w - p.w);
+    const shown = list.slice(0, 20).map((e) => { const where = sitesText(m, I, e.list); return `${e.name} (${kindsText(m, e.list)}${where ? `, ${where}` : ''})`; });
+    out.push(`${title}: ${shown.join('; ')}${list.length > 20 ? `; +${list.length - 20} more` : ''}`);
+  };
+  line('Inside the selection', bound.inside.map((e) => ({ name: `${partName(m, I, e.a)} → ${partName(m, I, e.b)}`, list: e.list, w: e.w })));
+  line('The selection uses', uses);
+  line('Used from outside by', users);
+  let text = out.join('\n');
+  if (text.length > limit) text = text.slice(0, limit - 40).replace(/\n[^\n]*$/, '') + '\n… (the selection is cut to fit)';
+  return `\n\n${text}`;
+}
+
+// Items for one-by-one runs: each node, link, and range on its own.
+function batchItems(space, scope) {
+  const m = space.model;
+  const I = index(m);
+  const items = [];
+  for (const k of scope.nodes) { const id = I.byKey.get(k); if (id != null) items.push({ label: m.nodes[id].from ? partName(m, I, id) : k, set: { nodes: [k], links: [], ranges: [] } }); }
+  for (const l of scope.links) { const a = I.byKey.get(l[0]), b = I.byKey.get(l[1]); if (a != null && b != null) items.push({ label: `${partName(m, I, a)} → ${partName(m, I, b)}`, set: { nodes: [], links: [l], ranges: [] } }); }
+  for (const r of scope.ranges) if (I.byKey.has(r[0])) items.push({ label: `${r[0]}:${r[1]}-${r[2]}`, set: { nodes: [], links: [], ranges: [r] } });
+  return items;
+}
+
+function agentTools(space, sdk, { write = true } = {}) {
   const step = (name, args, note) => space.emit('agent.step', { kind: 'tool', name, args, note });
   const staged = () => space.emit('stage.state', space.stageState());
   const obj = (props, required) => ({ type: 'object', properties: props, required, additionalProperties: false });
@@ -2140,7 +2483,7 @@ function agentTools(space, sdk) {
       try { return await fn(args ?? {}); } catch (e) { step(name, args, `Failed: ${e.message}`); return `Error: ${e.message}`; }
     },
   });
-  return [
+  const read = [
     make('list_files', 'List files under a folder with their line counts.', obj({ dir: str('Folder path, or empty for all repos.') }, []), ({ dir = '' }) => {
       const out = [];
       for (const n of space.model.nodes) if (n.kind === 'file' && (!dir || n.key.startsWith(dir.replace(/\/$/, '') + '/') || n.path.startsWith(dir.replace(/\/$/, '') + '/'))) out.push(`${n.key} (${n.lines})`);
@@ -2164,12 +2507,12 @@ function agentTools(space, sdk) {
     }),
     make('show_outline', 'Show the types and functions in a file with line ranges.', obj({ path: str('File path.') }, ['path']), ({ path: p }) => {
       const { key } = space.locate(p);
-      const nodes = space.model.nodes;
-      const file = nodes.find((n) => n.key === key);
+      const file = space.node(key);
       if (!file) throw new Error(`No such file: ${p}`);
+      const I = index(space.model);
       const out = [];
-      const walk = (id, depth) => { for (const n of nodes) if (n.up === id) { out.push(`${'  '.repeat(depth)}${n.form ?? n.kind} ${n.name} [${n.from}-${n.to}]`); walk(n.id, depth + 1); } };
-      walk(file.id, 0);
+      const walkOut = (id, depth) => { for (const k of I.kids[id]) { const n = space.model.nodes[k]; out.push(`${'  '.repeat(depth)}${n.form ?? n.kind} ${n.name} [${n.from}-${n.to}]`); walkOut(k, depth + 1); } };
+      walkOut(file.id, 0);
       step('show_outline', { path: key }, `${out.length} items`);
       return out.join('\n') || 'No types or functions found.';
     }),
@@ -2180,6 +2523,58 @@ function agentTools(space, sdk) {
       step('find_refs', { name }, `${uses.length} use${uses.length === 1 ? '' : 's'}`);
       return [...decl, ...uses.slice(0, 300)].join('\n') || 'Not found.';
     }),
+    make('show_links', 'Show what a file, type, or function uses (out), what uses it (in), or both, with link kinds, counts, and the path:line where each link happens.', obj({ name_or_path: str('A file path, a symbol key like web/src/cart.ts#Cart.pay, or a name like Cart.pay.'), dir: { type: 'string', enum: ['out', 'in', 'both'], description: 'out: what it uses. in: what uses it. both: both.' } }, ['name_or_path']), ({ name_or_path: q, dir = 'both' }) => {
+      const m = space.model;
+      const I = index(m);
+      const text = String(q ?? '').trim();
+      let ids = [];
+      try {
+        const [p, chain] = text.split('#');
+        const { key } = space.locate(p);
+        const id = I.byKey.get(chain ? `${key}#${chain}` : key);
+        if (id != null) ids = [id];
+      } catch { /* not a path */ }
+      if (!ids.length) {
+        const v = text.toLowerCase();
+        ids = m.nodes.filter((n) => n.from && (n.name.toLowerCase() === v || (n.key.split('#')[1] ?? '').toLowerCase() === v || (n.key.split('#')[1] ?? '').toLowerCase().endsWith('.' + v))).map((n) => n.id).slice(0, 3);
+      }
+      if (!ids.length) throw new Error(`Nothing named ${text}. Use a path or a name from show_outline.`);
+      const out = [];
+      let total = 0;
+      for (const id of ids) {
+        const n = m.nodes[id];
+        out.push(`${partName(m, I, id)} (${n.form ?? n.kind}, ${n.key.split('#')[0]}${n.from ? `:${n.from}-${n.to}` : ''})`);
+        for (const d of dir === 'both' ? ['out', 'in'] : [dir === 'in' ? 'in' : 'out']) {
+          const groups = new Map();
+          walk(I, id, (x) => {
+            for (const li of d === 'out' ? I.out[x] : I.inn[x]) {
+              const [s, t] = m.links[li];
+              const end = d === 'out' ? t : s;
+              if (isUnder(I, end, id)) continue;
+              const key = liftTo(I, end, 5);
+              const g = groups.get(key) ?? { list: [], w: 0 };
+              g.list.push(li); g.w += m.links[li][3];
+              groups.set(key, g);
+            }
+          });
+          out.push(d === 'out' ? 'uses:' : 'used by:');
+          const list = [...groups].sort((p, q) => q[1].w - p[1].w);
+          if (!list.length) out.push('- nothing');
+          for (const [end, g] of list.slice(0, 60)) {
+            const where = sitesText(m, I, g.list, true);
+            out.push(`- ${partName(m, I, end)} (${kindsText(m, g.list)}${where ? `, at ${where}` : ''})`);
+          }
+          if (list.length > 60) out.push(`- +${list.length - 60} more`);
+          total += list.length;
+        }
+      }
+      step('show_links', { name: text, dir }, `${total} link${total === 1 ? '' : 's'}`);
+      return out.join('\n');
+    }),
+  ];
+  if (!write) return read;
+  return [
+    ...read,
     make('write_file', 'Create or replace a whole file (staged).', obj({ path: str('File path.'), text: str('Full new content.') }, ['path', 'text']), ({ path: p, text }) => {
       const { key } = space.locate(p);
       space.stage.write(key, text);
@@ -2222,42 +2617,125 @@ async function makeClient(cfg) {
   return new OpenAI({ baseURL: cfg.endpoint, apiKey: cfg.apiKey || 'none', defaultHeaders: { 'X-Title': 'devibe' } });
 }
 
-export async function runAgent(space, { prompt, focus = [] }) {
+// Throws (before anything starts) when the agent cannot run.
+export function agentReady(space, { act } = {}) {
   if (space.agent.busy) throw new Error('The agent is already running.');
   if (!space.config.model || !space.config.endpoint) throw new Error('Set an endpoint and model in Settings.');
   if (!space.model) throw new Error('Open a repo first.');
-  const sdk = await import('@openai/agents');
-  sdk.setTracingDisabled(true);
-  const client = await makeClient(space.config);
-  const agent = new sdk.Agent({ name: 'devibe', instructions: brief(space), model: new sdk.OpenAIChatCompletionsModel(client, space.config.model), tools: agentTools(space, sdk) });
+  if (act && !ACT[act]) throw new Error(`Unknown action: ${act}`);
+}
+
+// One streamed run. Text deltas go to onText; throws with the partial text.
+async function runOnce(space, sdk, agent, input, onText) {
   const abort = new AbortController();
-  space.agent.busy = true;
   space.agent.abort = abort;
-  space.emit('agent.step', { kind: 'start', text: prompt, focus });
   let text = '';
   try {
-    const input = [...space.agent.history, sdk.user(prompt + focusText(space, focus))];
     const result = await sdk.run(agent, input, { stream: true, maxTurns: space.config.maxTurns || 40, signal: abort.signal });
     for await (const ev of result) {
       if (ev.type === 'raw_model_stream_event' && ev.data?.type === 'output_text_delta' && ev.data.delta) {
         text += ev.data.delta;
-        space.emit('agent.step', { kind: 'text', text: ev.data.delta });
+        onText(ev.data.delta);
       }
     }
     await result.completed;
-    space.agent.history = result.history ?? input;
-    const final = typeof result.finalOutput === 'string' ? result.finalOutput : text;
-    space.emit('agent.done', { text: final });
-    return final;
+    return { text: typeof result.finalOutput === 'string' ? result.finalOutput : text, history: result.history ?? input };
   } catch (err) {
-    const msg = abort.signal.aborted ? 'Stopped.' : err?.message ?? String(err);
-    space.emit('agent.done', { error: msg, text });
-    return null;
+    const e = new Error(abort.signal.aborted ? 'Stopped.' : err?.message ?? String(err));
+    e.text = text;
+    throw e;
+  } finally {
+    space.agent.abort = null;
+  }
+}
+
+// Run the agent on a set. `act` picks a server action (its prompt and its
+// tools: read-only actions get read tools only). `mode: 'each'` runs once per
+// member with a fresh history; only the batch summary joins the conversation.
+export async function runAgent(space, { prompt = '', act = null, set = null, focus = [], mode = 'together' } = {}) {
+  agentReady(space, { act });
+  const A = act ? ACT[act] : null;
+  const scope = scopeOf(set, focus);
+  const ask = String(prompt ?? '').trim();
+  const task = [A?.prompt, ask].filter(Boolean).join('\n\n');
+  if (!task) throw new Error('Ask something, or pick an action.');
+  const sdk = await import('@openai/agents');
+  sdk.setTracingDisabled(true);
+  const client = await makeClient(space.config);
+  const agent = new sdk.Agent({ name: 'devibe', instructions: brief(space), model: new sdk.OpenAIChatCompletionsModel(client, space.config.model), tools: agentTools(space, sdk, { write: A ? A.edits : true }) });
+  const label = A?.name ?? 'Ask';
+  space.agent.busy = true;
+  space.agent.halt = false;
+  space.agent.batch = mode === 'each';
+  try {
+    if (mode !== 'each') {
+      space.emit('agent.step', { kind: 'start', text: ask || label, act, mode: 'together', set: scope });
+      const input = [...space.agent.history, sdk.user(task + setText(space, scope))];
+      try {
+        const r = await runOnce(space, sdk, agent, input, (d) => space.emit('agent.step', { kind: 'text', text: d }));
+        space.agent.history = r.history;
+        space.emit('agent.done', { text: r.text });
+        return r.text;
+      } catch (e) {
+        space.emit('agent.done', { error: e.message, text: e.text ?? '' });
+        return null;
+      }
+    }
+    const items = batchItems(space, scope).slice(0, 50);
+    space.emit('agent.step', { kind: 'start', text: ask || label, act, mode: 'each', total: items.length, set: scope });
+    if (!items.length) { space.emit('agent.done', { error: 'Nothing to run on. Select something first.', text: '' }); return null; }
+    const results = [];
+    const changed = (before) => {
+      let n = 0;
+      for (const [k, it] of space.stage.items) if (!before.has(k) || before.get(k) !== it.after) n++;
+      for (const k of before.keys()) if (!space.stage.items.has(k)) n++;
+      return n;
+    };
+    for (let i = 0; i < items.length; i++) {
+      if (space.agent.halt) break;
+      const it = items[i];
+      space.emit('agent.step', { kind: 'item', index: i, total: items.length, label: it.label, state: 'run' });
+      const before = new Map([...space.stage.items].map(([k, x]) => [k, x.after]));
+      let state = 'none', files = 0, error;
+      try {
+        await runOnce(space, sdk, agent, [sdk.user(task + setText(space, it.set))], (d) => space.emit('agent.step', { kind: 'text', text: d, index: i }));
+        files = changed(before);
+        state = files ? 'staged' : 'none';
+      } catch (e) {
+        state = 'error';
+        error = e.message;
+        files = changed(before);
+        if (e.message === 'Stopped.') space.agent.halt = true;
+      }
+      results.push({ label: it.label, state, files, error });
+      space.emit('agent.step', { kind: 'item', index: i, total: items.length, label: it.label, state, files, error });
+      space.emit('stage.state', space.stageState());
+    }
+    const staged = results.filter((r) => r.state === 'staged');
+    const failed = results.filter((r) => r.state === 'error');
+    const head = `${label}, one by one: ${results.length} of ${items.length} item${items.length === 1 ? '' : 's'} done${results.length < items.length ? ' (stopped)' : ''}. ${staged.length} staged changes, ${failed.length} failed.`;
+    const summary = [head, '', ...results.map((r) => `- ${r.label}: ${r.state === 'staged' ? `staged ${r.files} file${r.files === 1 ? '' : 's'}` : r.state === 'error' ? `failed (${r.error})` : 'no change'}`)].join('\n');
+    space.agent.history = [...space.agent.history, sdk.user(`${task}\n\nRun one by one on ${items.length} item${items.length === 1 ? '' : 's'}:\n${items.map((x) => `- ${x.label}`).join('\n')}`), sdk.assistant(summary)];
+    space.emit('agent.done', { text: summary, batch: { act, total: items.length, done: results.length, items: results } });
+    return summary;
   } finally {
     space.agent.busy = false;
+    space.agent.batch = false;
     space.agent.abort = null;
     space.emit('stage.state', space.stageState());
   }
+}
+
+// Stop: in a one-by-one batch the first stop finishes the current item and
+// then stops; a second stop (or any stop of a single run) aborts at once.
+export function stopAgent(space) {
+  if (!space.agent.busy) return;
+  if (space.agent.batch && !space.agent.halt) {
+    space.agent.halt = true;
+    space.emit('agent.step', { kind: 'halt' });
+    return;
+  }
+  space.agent.abort?.abort();
 }
 
 export async function testAgent(cfg) {
@@ -2277,6 +2755,8 @@ const STATIC = {
   '/client.html': ['client.html', 'text/html'],
   '/client.mjs': ['client.mjs', 'text/javascript'],
   '/client.css': ['client.css', 'text/css'],
+  '/sets.mjs': ['sets.mjs', 'text/javascript'],
+  '/city.mjs': ['city.mjs', 'text/javascript'],
   '/lib/d3.js': ['node_modules/d3/dist/d3.min.js', 'text/javascript'],
 };
 const LIB_DIRS = [['/lib/three/addons/', 'node_modules/three/examples/jsm/'], ['/lib/three/', 'node_modules/three/build/']];
@@ -2342,17 +2822,24 @@ async function listDir(dir) {
 function handlers(space) {
   return {
     hello: () => {
-      return { type: 'hello', data: { config: space.configState(), model: space.model, stage: space.stageState(), busy: space.agent.busy } };
+      const acts = ACTS.map(({ id, name, edits, takes, about }) => ({ id, name, edits, takes, about }));
+      return { type: 'hello', data: { config: space.configState(), model: space.model, stage: space.stageState(), busy: space.agent.busy, acts, sets: space.setsState().sets } };
     },
     'repo.open': async ({ path: p }) => { await space.open(p); return { type: 'config.state', data: space.configState() }; },
     'repo.shut': ({ name }) => { space.shut(name); return { type: 'config.state', data: space.configState() }; },
     'repo.scan': async () => { await space.scan(); return null; },
     'repo.demo': async () => { await space.open(await makeSample(path.join(os.tmpdir(), 'devibe-demo'))); return { type: 'config.state', data: space.configState() }; },
     'dir.list': async ({ path: p }) => ({ type: 'dir.items', data: await listDir(p) }),
-    'file.read': ({ key }) => ({ type: 'file.text', data: { key, text: space.text(key) } }),
+    'file.read': ({ key, staged }) => ({ type: 'file.text', data: { key, text: staged ? space.stage.read(space.locate(key).key) : space.text(key), staged: !!staged || undefined } }),
+    'file.links': ({ key }) => ({ type: 'file.links', data: space.fileLinks(key) }),
     'text.find': ({ query, regex, cased }) => ({ type: 'find.hits', data: { query, hits: space.find(query, { regex, cased }) } }),
-    'agent.run': ({ prompt, focus }) => { runAgent(space, { prompt, focus }).catch(() => {}); return null; },
-    'agent.stop': () => { space.agent.abort?.abort(); return null; },
+    'agent.run': (opts) => {
+      agentReady(space, opts);
+      if (!opts.act && !String(opts.prompt ?? '').trim()) throw new Error('Ask something, or pick an action.');
+      runAgent(space, opts).catch((e) => space.emit('note', { level: 'error', text: e.message }));
+      return null;
+    },
+    'agent.stop': () => { stopAgent(space); return null; },
     'agent.reset': () => { space.agent.history = []; return { type: 'agent.reset', data: {} }; },
     'agent.test': async () => ({ type: 'agent.tested', data: await testAgent(space.config) }),
     'stage.diff': ({ key }) => ({ type: 'stage.diff', data: space.stage.diff(key) }),
@@ -2360,7 +2847,20 @@ function handlers(space) {
     'stage.discard': ({ keys }) => { space.stage.discard(keys); space.build(); return null; },
     'stage.undo': async () => { const done = await space.undoStage(); return { type: 'note', data: { level: 'good', text: done.length ? `Undid ${done.length} file${done.length === 1 ? '' : 's'}.` : 'Nothing to undo.' } }; },
     'stage.rename': ({ key, name }) => { const n = space.renameSymbol(key, name); space.build(); return { type: 'note', data: { level: 'good', text: `Staged rename in ${n} file${n === 1 ? '' : 's'}.` } }; },
-    'stage.move': ({ key, to }) => { const moved = space.moveFile(key, to); space.build(); return { type: 'note', data: { level: 'good', text: `Staged move of ${moved.length} file${moved.length === 1 ? '' : 's'}.` } }; },
+    'stage.move': ({ key, to }) => {
+      if (['type', 'func', 'space', 'part'].includes(space.node(key)?.kind)) {
+        const r = space.moveSymbol(key, to);
+        space.build();
+        return { type: 'note', data: { level: 'good', text: `Staged move of ${r.name} to ${r.to}.` } };
+      }
+      const moved = space.moveFile(key, to);
+      space.build();
+      return { type: 'note', data: { level: 'good', text: `Staged move of ${moved.length} file${moved.length === 1 ? '' : 's'}.` } };
+    },
+    'stage.edit': ({ key, from, to, text }) => { const k = space.stage.editRange(key, from, to, text ?? ''); space.build(); return { type: 'note', data: { level: 'good', text: `Staged edit to ${k}.` } }; },
+    'stage.hunk': ({ key, index: i }) => { const k = space.stage.revertHunk(key, i); space.build(); return { type: 'note', data: { level: 'good', text: `Reverted a change in ${k}.` } }; },
+    'set.save': ({ set }) => { const id = space.saveSet(set ?? {}); return { type: 'sets.state', data: { ...space.setsState(), id } }; },
+    'set.drop': ({ id }) => { space.dropSet(id); return { type: 'sets.state', data: space.setsState() }; },
     'stage.delete': ({ keys }) => { const n = space.deleteNodes(keys); space.build(); return { type: 'note', data: { level: 'good', text: `Staged ${n} deletion${n === 1 ? '' : 's'}.` } }; },
     'stage.preview': ({ on }) => { space.setPreview(on); return null; },
     'review.mark': ({ keys, on }) => { space.mark(keys, on); return null; },
@@ -2436,6 +2936,14 @@ export async function makeSample(dir) {
       await fsp.appendFile(path.join(dir, f), `\n`);
       await git(['add', f], `2026-02-1${i}T10:00:00Z`);
       await git(['commit', '-q', '-m', `Tune ${f}`], `2026-02-1${i}T10:00:00Z`);
+    }
+    // The web client and the order service keep changing together, though
+    // nothing links them: a hidden coupling (an API contract).
+    for (let i = 0; i < 5; i++) {
+      const date = `2026-02-2${i}T10:00:00Z`;
+      for (const f of ['web/src/api.ts', 'server/Orders/OrderService.cs']) await fsp.appendFile(path.join(dir, f), `\n`);
+      await git(['add', 'web/src/api.ts', 'server/Orders/OrderService.cs'], date);
+      await git(['commit', '-q', '-m', `Sync the order API (${i + 1})`], date);
     }
     await git(['add', '-A'], '2026-03-01T10:00:00Z');
     await git(['commit', '-q', '-m', 'Add drafts'], '2026-03-01T10:00:00Z');
@@ -2608,6 +3116,18 @@ export async function checkout(cart: Cart, card: string, coupon?: string, region
   // if (old.ok) { return old; }
   // console.log(old.status);
   return formatPrice(total);
+}
+`,
+    'web/src/cart.test.ts': `import { Cart } from './cart';
+
+export function testAddsLines() {
+  const cart = new Cart();
+  cart.add(1, 2);
+  if (cart.lines.length !== 1) throw new Error('expected one line');
+}
+
+export function testTotalIsZeroWhenEmpty() {
+  if (new Cart().total() !== 0) throw new Error('expected 0');
 }
 `,
     'web/src/api.ts': `const BASE = '/api';
