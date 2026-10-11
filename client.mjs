@@ -817,7 +817,13 @@ function setupGL() {
   // the first switch to a layout never stalls on a compile.
   const warm = new LineSegments2(new LineSegmentsGeometry(), lineMat(LINK_WIDTH.call));
   links.add(warm);
-  renderer.compileAsync(scene, camera).catch(() => {}).finally(() => { links.remove(warm); warm.geometry.dispose(); });
+  // A program's first use checks its compile log, which waits for the GPU to
+  // finish everything queued; do that here too, while the queue is empty.
+  renderer.compileAsync(scene, camera).catch(() => {}).finally(() => {
+    links.remove(warm);
+    warm.geometry.dispose();
+    for (const p of renderer.info.programs ?? []) p.getUniforms?.();
+  });
 }
 
 function sizeGL() {
@@ -957,7 +963,8 @@ function useLayout(next, { animate = true, fit = false } = {}) {
   placeItems(R.morph ? 0 : 1);
   setZoomRange();
   if (fit) fitAll(motion ? 720 : 0);
-  buildLinks();
+  // Links hide while a layout morphs; they are built when it ends.
+  if (!R.morph) buildLinks();
   requestDraw();
 }
 
@@ -3009,8 +3016,8 @@ function drawDock() {
 function mount(el, kids) {
   const keep = new Set(kids);
   for (const c of [...el.children]) if (!keep.has(c)) c.remove();
-  let at = el.firstChild;
-  for (const k of kids) { if (k === at) at = at.nextSibling; else el.insertBefore(k, at); }
+  let at = el.firstElementChild;
+  for (const k of kids) { if (k === at) at = at.nextElementSibling; else el.insertBefore(k, at); }
 }
 
 // The Check body is rebuilt only when what it lists changes.
@@ -3312,7 +3319,6 @@ function drawOne(body, id) {
   if (fi) facts.push(['Used by', `${fmt(fi)} ${fi === 1 ? detailName().replace(/s$/, '') : detailName()}`]);
   const rv = reviewOf(id);
   facts.push(['Review', rv === 'ok' ? 'Reviewed' : rv === 'stale' ? 'Changed since review' : 'Not reviewed']);
-  if (T.count[id]) facts.push(['Issues', fmt(T.count[id])]);
   if (f?.gen) facts.push(['Generated', 'Yes']);
   body.append(h('div', { class: 'facts' }, facts.map(([a, b]) => h('div', { class: 'fact' }, h('span', null, a), h('b', null, String(b))))));
   if (n.head && n.kind !== 'part' && !f) body.append(h('div', { class: 'sig' }, n.head));
@@ -3970,7 +3976,8 @@ async function drawCode() {
     // Keep the reader's place when the sheet redraws (staging, more lines).
     const prev = el.querySelector('.code-body');
     bodyEl = h('div', { class: 'diff-body code-body' }, table);
-    if (prev && c.scrolled) { const top = prev.scrollTop; requestAnimationFrame(() => { bodyEl.scrollTop = top; }); }
+    if (prev && c.drawn) { const top = prev.scrollTop; requestAnimationFrame(() => { bodyEl.scrollTop = top; }); }
+    c.drawn = true;
     if (edit) setTimeout(() => { edit.focus(); edit.style.height = `${edit.scrollHeight + 4}px`; }, 0);
   }
   el.replaceChildren(head, bodyEl);
@@ -4841,7 +4848,7 @@ function boot() {
   $('#brand').addEventListener('click', () => hub.emit('box.open', 'open'));
   document.addEventListener('pointerdown', (e) => { if (!$('#ask').hidden && !$('#ask').contains(e.target)) unpop(); }, true);
   for (const box of document.querySelectorAll('dialog')) box.addEventListener('click', (e) => { if (e.target === box) box.close(); });
-  document.fonts?.ready.then(() => { measureMono(); widths.clear(); requestDraw(); });
+  document.fonts?.ready.then(() => { measureMono(); widths.clear(); widthCount = 0; requestDraw(); });
   drawFoot();
   wire.open();
 }

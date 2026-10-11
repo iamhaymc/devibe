@@ -140,13 +140,22 @@ code, .mono { font-family: var(--mono); font-size: 12px; }
 
 /* ── Surfaces ── */
 
-.glass, .panel, #bar > *, #foot > *, .tip, .box, .sheet, .pop, .toast {
+/* Small floating chrome is frosted glass. Large panels are opaque: blurring
+   their area behind a map that redraws every frame costs more GPU time than
+   the map itself. */
+.glass, #bar > *, #foot > *, .tip, .pop, .toast {
   background: var(--glass);
   border: 1px solid var(--edge);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
   backdrop-filter: blur(16px) saturate(1.15);
   -webkit-backdrop-filter: blur(16px) saturate(1.15);
+}
+.panel, .box, .sheet {
+  background: var(--surface);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
 }
 
 /* ── Bar ── */
@@ -714,6 +723,7 @@ textarea:focus, input:focus { border-color: var(--accent); }
 .title .path { color: var(--ink-3); font-size: 12px; word-break: break-all; margin-top: 2px; }
 .facts { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--edge); border: 1px solid var(--edge); border-radius: 9px; overflow: hidden; margin: 12px 0; }
 .fact { background: var(--surface); padding: 7px 10px; }
+.fact:last-child:nth-child(odd) { grid-column: 1 / -1; }
 .fact span { display: block; color: var(--ink-3); font-size: 11px; }
 .fact b { font-weight: 600; font-variant-numeric: tabular-nums; }
 .sig { font: 12px/1.5 var(--mono); padding: 8px 10px; border-radius: 8px; background: var(--raise); border: 1px solid var(--edge); color: var(--ink-2); white-space: pre-wrap; word-break: break-word; margin-bottom: 12px; }

@@ -382,7 +382,7 @@ export function makeCity(env) {
   const proj = (A, x, y, z) => [A.O[0] + x * A.u[0] + y * A.v[0] + z * A.w[0], A.O[1] + x * A.u[1] + y * A.v[1] + z * A.w[1]];
 
   // Geometry at rest, with the reading pose applied.
-  function rest(i) {
+  function rest(i, out = {}) {
     const o = i * 6;
     const t = C.to;
     const b = C.inst[i];
@@ -392,36 +392,53 @@ export function makeCity(env) {
       z = b.zb + (z - b.zb) * f;
       d *= f;
     }
-    return { x: t[o], y: t[o + 1], w: t[o + 2], h: t[o + 3], z, d };
+    out.x = t[o]; out.y = t[o + 1]; out.w = t[o + 2]; out.h = t[o + 3]; out.z = z; out.d = d;
+    return out;
   }
   const restOf = (b) => { const i = C.index.get(b.key); return i == null ? { x: b.x, y: b.y, w: b.w, h: b.h, z: b.z, d: b.d } : rest(i); };
   const topOf = (b) => { const r = restOf(b); return r.z + r.d; };
 
   // ───────────── Skyline ─────────────
 
+  // The boxes over each cell, in flat arrays: cell c holds
+  // items[start[c] .. start[c + 1]). Built in two passes (count, then fill).
   function grid(filter) {
     const L = C.lay;
     const b = L.bounds;
-    const lots = [...L.files.values()].map((F) => F.lot.w * F.lot.h).filter((a) => a > 0).sort((p, q) => p - q);
-    const median = lots.length ? lots[Math.floor(lots.length / 2)] : b.w * b.h / 100;
-    const cell = Math.max(Math.sqrt(median), b.w / 256, b.h / 256, 1e-6);
-    const nx = Math.max(1, Math.min(256, Math.ceil(b.w / cell))), ny = Math.max(1, Math.min(256, Math.ceil(b.h / cell)));
+    if (!L.cell) {
+      const lots = [...L.files.values()].map((F) => F.lot.w * F.lot.h).filter((a) => a > 0).sort((p, q) => p - q);
+      const median = lots.length ? lots[Math.floor(lots.length / 2)] : b.w * b.h / 100;
+      L.cell = Math.max(Math.sqrt(median), b.w / 256, b.h / 256, 1e-6);
+    }
+    const nx = Math.max(1, Math.min(256, Math.ceil(b.w / L.cell))), ny = Math.max(1, Math.min(256, Math.ceil(b.h / L.cell)));
     const cw = b.w / nx, ch = b.h / ny;
-    const cells = Array.from({ length: nx * ny }, () => []);
-    const box = new Float32Array(C.inst.length * 6);
+    const n = C.inst.length;
+    const box = new Float32Array(n * 6);
+    const span = new Int32Array(n * 4).fill(-1);
+    const start = new Int32Array(nx * ny + 1);
     let maxZ = 0, count = 0;
-    C.inst.forEach((it, i) => {
-      if (!filter(it, i)) return;
-      const r = rest(i);
-      if (r.d <= 1e-4 || r.w <= 0 || r.h <= 0) return;
-      box.set([r.x, r.y, r.x + r.w, r.y + r.h, r.z, r.z + r.d], i * 6);
+    const r = {};
+    for (let i = 0; i < n; i++) {
+      if (!filter(C.inst[i], i)) continue;
+      rest(i, r);
+      if (r.d <= 1e-4 || r.w <= 0 || r.h <= 0) continue;
+      const o = i * 6;
+      box[o] = r.x; box[o + 1] = r.y; box[o + 2] = r.x + r.w; box[o + 3] = r.y + r.h; box[o + 4] = r.z; box[o + 5] = r.z + r.d;
       maxZ = Math.max(maxZ, r.z + r.d);
       const gx0 = clamp(Math.floor((r.x - b.x) / cw), 0, nx - 1), gx1 = clamp(Math.floor((r.x + r.w - b.x) / cw), 0, nx - 1);
       const gy0 = clamp(Math.floor((r.y - b.y) / ch), 0, ny - 1), gy1 = clamp(Math.floor((r.y + r.h - b.y) / ch), 0, ny - 1);
-      for (let gy = gy0; gy <= gy1; gy++) for (let gx = gx0; gx <= gx1; gx++) cells[gy * nx + gx].push(i);
+      span[i * 4] = gx0; span[i * 4 + 1] = gx1; span[i * 4 + 2] = gy0; span[i * 4 + 3] = gy1;
+      for (let gy = gy0; gy <= gy1; gy++) for (let gx = gx0; gx <= gx1; gx++) start[gy * nx + gx + 1]++;
       count++;
-    });
-    return { cells, box, nx, ny, cw, ch, x0: b.x, y0: b.y, maxZ, count };
+    }
+    for (let c = 0; c < nx * ny; c++) start[c + 1] += start[c];
+    const items = new Int32Array(start[nx * ny]);
+    const fill = start.slice(0, nx * ny);
+    for (let i = 0; i < n; i++) {
+      if (span[i * 4] < 0) continue;
+      for (let gy = span[i * 4 + 2]; gy <= span[i * 4 + 3]; gy++) for (let gx = span[i * 4]; gx <= span[i * 4 + 1]; gx++) items[fill[gy * nx + gx]++] = i;
+    }
+    return { start, items, box, nx, ny, cw, ch, x0: b.x, y0: b.y, maxZ, count, seen: new Uint32Array(n), stamp: 0 };
   }
 
   function skyBuild() {
@@ -458,16 +475,19 @@ export function makeCity(env) {
     let tMaxX = nextX(gx), tMaxY = nextY(gy);
     let best = null, bestZ = -Infinity;
     const hits = all ? new Set() : null;
-    const seen = new Set();
+    // Boxes span several cells; a stamp per walk tests each box once.
+    const seen = G.seen, stamp = ++G.stamp;
     let tCell = t0;
     for (let guard = 0; guard < G.nx + G.ny + 4; guard++) {
       const tExit = Math.min(tMaxX, tMaxY, t1);
-      for (const i of G.cells[gy * G.nx + gx]) {
-        if (seen.has(i)) continue;
-        seen.add(i);
+      const c = gy * G.nx + gx;
+      for (let k = G.start[c], end = G.start[c + 1]; k < end; k++) {
+        const i = G.items[k];
+        if (seen[i] === stamp) continue;
+        seen[i] = stamp;
         if (skip?.(i)) continue;
         const o = i * 6;
-        const [x0, y0, x1, y1, z0, z1] = [G.box[o], G.box[o + 1], G.box[o + 2], G.box[o + 3], G.box[o + 4], G.box[o + 5]];
+        const x0 = G.box[o], y0 = G.box[o + 1], x1 = G.box[o + 2], y1 = G.box[o + 3], z0 = G.box[o + 4], z1 = G.box[o + 5];
         let lo = Math.max(z0, zEnd), hi = Math.min(z1, zTop), face = 'top';
         for (let axis = 0; axis < 2; axis++) {
           const p = P0[axis], d = D[axis], a = axis ? y0 : x0, b = axis ? y1 : x1;
