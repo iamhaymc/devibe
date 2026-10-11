@@ -30,7 +30,7 @@
   </header>
 
   <aside id="dock" class="panel dock" aria-label="Check and change"></aside>
-  <aside id="info" class="panel info" aria-label="Details" hidden></aside>
+  <aside id="info" class="panel info" aria-label="Selection" hidden></aside>
 
   <footer id="foot">
     <div id="legend" class="legend"></div>
@@ -39,10 +39,12 @@
 
   <nav id="tabs" class="tabs" aria-label="Panels"></nav>
 
-  <section id="diff" class="sheet diff" hidden></section>
+  <div id="act" class="act" role="toolbar" aria-label="Actions for the selection" hidden></div>
+  <section id="code" class="sheet diff code" aria-label="Code" hidden></section>
   <section id="ask" class="pop" hidden></section>
   <div id="tip" class="tip" hidden></div>
   <div id="toasts" class="toasts" aria-live="polite"></div>
+  <div id="live" class="sr" aria-live="polite"></div>
 
   <dialog id="open-box" class="box"></dialog>
   <dialog id="setup-box" class="box"></dialog>

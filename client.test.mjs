@@ -127,7 +127,7 @@ describe('devibe client', () => {
     const [x, y] = await center('acme-shop/server/Orders');
     await page.mouse.dblclick(x, y);
     await idle();
-    assert.equal(await state(() => window.devibe.state.sel[0]), 'acme-shop/server/Orders');
+    assert.equal(await state(() => window.devibe.state.set.nodes[0]), 'acme-shop/server/Orders');
     await shot('03-folder');
   });
 
@@ -158,7 +158,7 @@ describe('devibe client', () => {
     await page.keyboard.press('ArrowDown');
     await page.keyboard.press('Enter');
     await idle();
-    assert.ok((await state(() => window.devibe.state.sel.length)) === 1);
+    assert.ok((await state(() => window.devibe.state.set.nodes.length)) === 1);
   });
 
   test('searches file contents', async () => {
@@ -232,7 +232,7 @@ describe('devibe client', () => {
       await page.mouse.click(x, y);
     }
     await page.keyboard.up('Shift');
-    assert.equal(await state(() => window.devibe.state.sel.length), 3);
+    assert.equal(await state(() => window.devibe.state.set.nodes.length), 3);
     await page.keyboard.press('r');
     await page.waitForFunction(() => window.devibe.state.model.marks['acme-shop/web/src/checkout.ts'] === 'ok');
     await page.locator('#tools select').nth(1).selectOption('review');
@@ -255,10 +255,11 @@ describe('devibe client', () => {
 
   test('shows a staged change as a diff', async () => {
     await page.locator('#dock .change').first().click();
-    await page.locator('#diff').waitFor({ state: 'visible' });
-    assert.ok(await page.locator('#diff tr.add').count() >= 1);
+    await page.locator('#code').waitFor({ state: 'visible' });
+    await page.locator('#code tr.add').first().waitFor();
+    assert.ok(await page.locator('#code tr.add').count() >= 1);
     await shot('18-diff');
-    await page.locator('#diff button[aria-label="Close diff"]').click();
+    await page.locator('#code button[aria-label="Close the Code sheet"]').click();
   });
 
   test('previews staged changes on the map, applies, and undoes', async () => {
