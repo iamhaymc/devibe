@@ -2757,6 +2757,7 @@ const STATIC = {
   '/client.css': ['client.css', 'text/css'],
   '/sets.mjs': ['sets.mjs', 'text/javascript'],
   '/city.mjs': ['city.mjs', 'text/javascript'],
+  '/force.mjs': ['force.mjs', 'text/javascript'],
   '/lib/d3.js': ['node_modules/d3/dist/d3.min.js', 'text/javascript'],
 };
 const LIB_DIRS = [['/lib/three/addons/', 'node_modules/three/examples/jsm/'], ['/lib/three/', 'node_modules/three/build/']];

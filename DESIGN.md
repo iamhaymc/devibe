@@ -53,6 +53,7 @@ Files:
 | `client.html` | Page shell: canvases, bar, panels, Act bar, Code sheet, dialogs. Loads d3 and three.js from `node_modules` through the server. |
 | `client.css` | Theme tokens (dark, light, system), layout, panels, responsive rules. |
 | `client.mjs` | Hub, state, wire, Map, Graph, Layers, tile renderer, 2D ink, picking, panels, Act bar, Code sheet, keys. |
+| `force.mjs` | The Graph force layout. Runs in place for small graphs and as a module worker (`force.mjs?worker`) for large ones. |
 | `city.mjs` | City: box shader, open-building planner, skyline index (picking and occlusion), orbit and pivot, labels, roof code, skyways, hull outlines, isolate and cutaway. `makeCity(env)` takes the client's state and helpers. |
 | `sets.mjs` | The set core, with no DOM, d3, or three.js: model index, lifting, strongly connected groups and levels, grow operations, set boundary, Find queries, color classes, recipe replay. Shared by the client and the server. |
 | `sets.test.mjs` | Unit tests for `sets.mjs` on the demo model. |
@@ -188,7 +189,7 @@ The client is message-driven. `hub.emit(type, data)` runs every handler register
 | --- | --- | --- |
 | Tiles | three.js `InstancedBufferGeometry` with a custom shader | Every rectangle and circle in Map, Graph, and Layers: one instance each, with a signed-distance rounded box, antialiased edges, inner edge shading, and zoom-aware fading of file bodies as code becomes readable. Hundreds of thousands of tiles in one draw call. |
 | City boxes | three.js `InstancedBufferGeometry` box with a custom shader (`city.mjs`) | Plinths, lots, signs, podiums, towers, and shells. Each instance carries its previous and next geometry, so a morph costs one uniform per frame. Hemisphere and directional light, screen-space edge darkening, a brighter top when hovered. Two passes over one geometry: opaque, then ghosts (transparent, no depth write). |
-| Links | three.js `LineSegments2` (fat, antialiased screen-space lines) | Links as sampled curves with a dim-to-bright gradient from source to target, one group per line width. The sampled polylines are kept for picking. |
+| Links | three.js `LineSegments2` (fat, antialiased screen-space lines) | Links as sampled curves with a dim-to-bright gradient from source to target, one group per line width, in three layers that rebuild only when their inputs change: the base (every link in All, or the faint backdrop of Graph and Layers), the set (its boundary and picked links), and the hover. Routes are cached per layout, and the last few base and hover layers are kept, so hovering and selecting never re-route the base. The sampled polylines are kept for picking; each bright link also keeps its arrowhead point and direction. |
 | Ink | Canvas 2D on top of WebGL | Text and outlines with native font rendering: labels, code minimaps, code text, call-site marks, issue markers, arrowheads, selection and hover outlines, drag ghost, and in City the code on the roofs. Only what is visible and large enough is drawn. |
 
 d3 provides the layouts (`treemap`, `forceSimulation`, `quadtree`), zoom and pan (`d3-zoom`, including pinch), transitions and easing, curve sampling (`curveBundle`, `curveNatural`), and formatting.
@@ -197,12 +198,14 @@ World units are chosen so that one code line is about one unit, which keeps 32-b
 
 Layout changes morph: each tile animates from its previous rectangle (or its parent's) to its new one in 720 ms. City grows buildings from the ground while the view tilts.
 
+**Keeping it fast.** Fill colors are computed once per node for the current Color, Detail, model, and theme; Find, the rule spotlight, and Isolate only dim them, and recoloring waits for the next frame so several changes cost one pass. Per-file code facts (finding marks by line, call-site marks, the set's ranges) are cached, minimap bars are batched into one fill per token color, label sizes snap to half pixels so measured text widths are reused while zooming, and hover links follow after the pointer rests for 50 ms. Every shader compiles at startup, the analyses the first click needs (lifted links, loops, fan-in) run when the page is idle, and panels rebuild only what changed (the Check list, the legend, the agent log's entries, the tip), keeping the prompt's text and focus while the agent streams.
+
 ### Layouts
 
 | Layout | Key | What it shows | How |
 | --- | --- | --- | --- |
 | Map | `1` | Repos, folders, files, and the code inside, nested and sized by lines. | Squarified treemap. Folder headers scale with folder size and are never smaller than file headers. Inside each file, code is laid out in columns of 84 characters (4 for line numbers); types and functions are bands over their line ranges, indented by depth. The treemap's shape follows the screen's shape, so phones and portrait tablets fill the screen. |
-| Graph | `2` | Parts at the chosen detail pulled together by their links. | Force simulation seeded from Map positions (so related folders stay near each other), with link, charge, collision, and home forces. Up to 4,000 nodes; runs at most 1.1 s before drawing. |
+| Graph | `2` | Parts at the chosen detail pulled together by their links. | Force simulation seeded from Map positions (so related folders stay near each other), with link, charge, collision, and home forces. Up to 4,000 nodes. Over 400 nodes it runs in a worker for up to 4 s while the view stays live ("Laying out the graph…"); otherwise in place for up to 1.1 s. Graph and Layers are kept per Detail until the Map changes, so switching back is instant. |
 | Layers | `3` | Parts stacked by dependency: base code at the bottom, code that depends on it above. | Strongly connected groups share a level; each level is one more than the highest level it depends on. Rows are ordered by folder, then by four barycenter sweeps to cut crossings. Parts in a loop are tinted red. |
 | City | `4` | The Map extruded: folders are plinths, files are buildings, and close up a building opens into podiums (types) and towers (functions) standing on their own code. | Map rectangles as boxes. See [City](#city). |
 
@@ -320,7 +323,7 @@ The set is what you work with. Every action takes it, and the Selection panel sh
 
 **Queries.** Find keeps fuzzy name search; space-separated terms combine with AND. Filters: `kind:file|type|func|dir`, `in:<path>`, `lang:<id>`, `rule:<id>` or `rule:high|medium|low`, `uses:<name>`, `usedby:<name>` (lifted to the current Detail), the measures `lines`, `cx`, `nest`, `args`, `churn`, `fanin` with `< <= = >= >`, `age<Ndays`, and the states `staged`, `dirty`, `reviewed:yes|no|stale`, `test:yes|no`, `gen:no`. A bad filter shows help in the list and never throws. The list says how many parts match and offers **Select all**. An empty query lists saved sets; a query starting with `>` lists the actions for the set, disabled ones with the reason.
 
-**Live and saved sets.** A set made by a query, rule, legend color, level, staged files, or grow keeps its recipe and replays on every `repo.model` push, so "all high findings" stays true after edits land. The Selection header says what it is live on ("Live: rule Copied code"); **Freeze** drops the recipe. A set without a recipe drops keys that no longer exist. **Save** stores the set by name in the ledger; saved sets show in Find and in the Selection header menu, and load when every repo they name is open (missing keys are dropped with a note).
+**Live and saved sets.** A set made by a query, rule, legend color, level, staged files, or grow keeps its recipe and replays on every `repo.model` push, so "all high findings" stays true after edits land. The Selection header says what it is live on ("Live · rule Copied code"; repeated hops read as one, "+ uses ×2"); **Freeze** drops the recipe. A set without a recipe drops keys that no longer exist. **Sets** in the Selection header saves the set by name in the ledger and lists the saved ones; saved sets also show in Find, and load when every repo they name is open (missing keys are dropped with a note).
 
 ### Interaction
 
@@ -363,17 +366,18 @@ The set is what you work with. Every action takes it, and the Selection panel sh
 
 ### Panels
 
-- **Bar**: open, breadcrumb (selection path, or the folder at the center of the view), find, layout, detail, color, Height (City only), links, fit, settings, help.
+- **Bar**: open; breadcrumb (the selection's path, or the folder at the center of the view; with one repo open its name is left out, and long paths fold their middle into …); find; layout; one group for detail, color, Height (City only), and links; one for fit, settings, and help.
 - **Find**: names, file text, queries with **Select all**, saved sets, and `>` actions (the command palette).
-- **Check**: counts by level, review progress, and findings grouped by rule (worst first). Clicking a rule spotlights it: the map dims everything else and outlines each hit in its level color. **Select all** puts the rule's findings in the set, so the Act bar offers Fix or Delete. Each finding can be opened, fixed with the agent, or marked as fine.
+- **Check**: counts by level, review progress, and findings grouped by rule (worst first). Clicking a rule spotlights it: the map dims everything else and outlines each hit in its level color. **Select all** puts the rule's findings in the set, so the Act bar offers Fix or Delete. Each finding is one row (the part, its file and line) with its note under it, and can be opened, fixed with the agent, or marked as fine.
 - **Change**: staged changes (apply, discard, preview, undo, **Select changed**, open in the Code sheet), the conversation with tool steps as they happen (files the agent touches flash on the map) and one entry per one-by-one batch ("Document · one by one · 3 of 12", a row per item), then a scope line ("Scope: 3 parts · 1 link", or the whole workspace with an empty set), the mode toggle (All at once, One by one), and the prompt.
 - **Selection** (opens while the set is not empty):
-  - **Header**: the set's name or summary and line count, what it is live on with **Freeze**, the saved sets menu, **Save**, **Isolate**, **Clear**.
+  - **Header**: the set's name or summary and line count, **Sets** (save this set, load or remove saved ones), **Isolate**, **Clear**, and under them what it is live on with **Freeze**.
   - **One part**: kind, path and lines, facts (lines, branches, nesting, parameters, language, commits, last change, used by, review, issues), signature, base types, a code peek (click for the Code sheet), Zoom, Code, Editor (VS Code), findings, Uses and Used by (link kinds and counts; **+** adds a row to the set), Grow, outline (files), largest files (folders), packages (files).
-  - **Several**: members grouped by folder, each with a remove ×; links; ranges; **Interface**: links inside the set, the top 14 things it uses and the top 14 that use it (click a row to select that bundle); findings by rule (click to narrow the set); Grow.
+  - **Several**: members grouped by folder, each with a remove ×; links; ranges; **Interface**: links inside the set, the top 14 things it uses and the top 14 that use it (click a row to select that bundle); findings by rule (click to narrow the set); Grow (only the operations that apply; the `>` palette lists the rest with the reason).
   - **A link**: both ends, kinds, weight, and the sites: each source line with its code. Click a site to fly to it.
-- **Act bar**: a pill above the footer while the set is not empty: the summary (opens Selection), the top five actions that fit, **More** (Find in `>` mode), the mode, and Clear. See [Agent reference](#agent-reference) for the ranking.
-- **Code sheet** (replaces the Diff sheet): **Code** tab with the file (staged text if staged), syntax colors, and the selected range highlighted; **Edit** turns the range (a symbol's lines, a range member, or the whole file) into a text area, and Ctrl/Cmd+S stages it. **Diff** tab (staged files): unified diff with a **Revert** button per hunk, previous and next staged file, Apply, Discard. Opened by Edit in the Act bar, Shift+Enter, double-clicking readable code, or a staged change.
+- **Act bar**: a pill above the footer while the set is not empty, centered in the free space between the panels: the summary (opens Selection), the top five actions that fit (fewer when the space is narrow; More still lists them all), **More** (Find in `>` mode), the mode (all at once, or one by one when lit), and Clear. See [Agent reference](#agent-reference) for the ranking.
+- **Toasts**: one short message at a time (errors stay until they time out), above the Act bar on wide screens and under the bar on phones.
+- **Code sheet** (replaces the Diff sheet): **Code** tab with the file (staged text if staged), syntax colors, and the selected range highlighted; **Edit** turns the range (a symbol's lines, a range member, or the whole file) into a text area, and Ctrl/Cmd+S stages it. **Diff** tab (staged files): unified diff with a **Revert** button per hunk, previous and next staged file, Apply, Discard. Opened by Edit in the Act bar, Shift+Enter, double-clicking readable code, or a staged change. Files over 4,000 lines show a window around the target, with rows to show 2,000 more lines either way.
 - **Dialogs**: Open (path, folder browser with git badges, open and recent repos, demo on first run), Settings (endpoint, model, key, max steps, style guide, theme, Test), Help (keys, actions from the same registry as the Act bar, mouse and touch).
 
 The Selection list and the Act bar are keyboard-navigable, Act bar buttons show their keys in tooltips, and a polite live region announces set changes ("12 parts selected").
@@ -382,9 +386,9 @@ The Selection list and the Act bar are keyboard-navigable, Act bar buttons show 
 
 | Width | Layout |
 | --- | --- |
-| Over 1240 px | Full bar, Check/Change dock on the left, Selection on the right, legend and status at the bottom, Act bar centered above the legend. |
+| Over 1240 px | Full bar, Check/Change dock on the left, Selection on the right, legend and status (files and lines; the full counts in its tooltip) at the bottom, Act bar centered above the legend. In City up to 1560 px the breadcrumb gives way to the Height picker, and up to 1400 px so does the Detail label. |
 | 761–1240 px | Breadcrumb hidden; detail, color, height, angle, and links move into a View panel opened from the bar. |
-| 760 px and under | Compact bar; a bottom tab bar (View, Check, Change, Selection) opens each panel as a bottom sheet, and the Act bar scrolls sideways above it. The map refits above the open sheet. Touch: pinch, drag, tap, double-tap, long-press, two-finger twist in City. |
+| 760 px and under | Compact bar; a bottom tab bar (View, Check, Change, Selection) opens each panel as a bottom sheet, and the Act bar shows the actions that fit above it. The map refits above the open sheet. Touch: pinch, drag, tap, double-tap, long-press, two-finger twist in City. |
 
 ## Message reference
 
@@ -648,7 +652,7 @@ Names are short, plain, and paired so related things read alike:
 | Watched folders per repo | 4,000 |
 | Git history read | Last 3,000 commits |
 | Graph and Layers nodes | 4,000 (the most linked and largest are kept) |
-| Links drawn | 4,000 bright plus 6,000 faint |
+| Links drawn | Base: 4,000 (All) or 6,000 faint (Graph and Layers in Focus); set: 4,000; hover: 800 |
 | Arrowheads | 600, heaviest first |
 | Text search results | 400 |
 | Cached file texts in the client | 400 |

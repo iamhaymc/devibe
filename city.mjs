@@ -310,7 +310,6 @@ export function makeCity(env) {
     const th = env.theme;
     const bg = env.rgb(th.bg);
     const lit = env.makeLit();
-    const ctx = env.classCtx();
     const g = C.geo;
     const col = g.getAttribute('aColor').array;
     const T = state.T;
@@ -327,7 +326,7 @@ export function makeCity(env) {
       let c;
       if (b.part === 'ghost') c = env.rgb(b.ghost === 'gone' ? env.STATUS.critical : env.STATUS.good);
       else {
-        c = env.colorOf(env.classOf(b.id, state.paint, ctx), b.id);
+        c = env.paintOf(b.id);
         if (b.part === 'dir') c = env.mix(c, env.rgb(th.ink3), 0.12);
         if (b.part === 'lot') c = env.mix(c, bg, 0.5);
         if (lit && !lit(b.id)) c = env.mix(c, bg, b.part === 'dir' ? 0.45 : 0.78);
@@ -339,7 +338,7 @@ export function makeCity(env) {
       }
       if (C.cut.has(i)) ghost = true;
       C.ghostOf[i] = ghost ? 1 : 0;
-      col.set([c[0], c[1], c[2], 1], i * 4);
+      col[i * 4] = c[0]; col[i * 4 + 1] = c[1]; col[i * 4 + 2] = c[2]; col[i * 4 + 3] = 1;
     });
     g.getAttribute('aColor').needsUpdate = true;
     let sig = 0;
@@ -569,10 +568,13 @@ export function makeCity(env) {
     if (C.hoverOpen > 0) forced.add(C.hoverOpen);
     const want = [];
     let budget = BUDGET - C.lay.items.length - C.lay.ghosts.length;
+    const A = V.A;
     for (const F of C.lay.files.values()) {
-      const corners = [[F.lot.x, F.lot.y], [F.lot.x + F.lot.w, F.lot.y], [F.lot.x, F.lot.y + F.lot.h], [F.lot.x + F.lot.w, F.lot.y + F.lot.h]].map(([x, y]) => proj(V.A, x, y, F.lotTop));
-      const xs = corners.map((p) => p[0]), ys = corners.map((p) => p[1]);
-      const on = Math.max(...xs) > -80 && Math.min(...xs) < R.W + 80 && Math.max(...ys) > -80 && Math.min(...ys) < R.H + 80;
+      // The lot's screen bounds: its corner plus the projected sides (affine).
+      const L = F.lot;
+      const ox = A.O[0] + L.x * A.u[0] + L.y * A.v[0] + F.lotTop * A.w[0], oy = A.O[1] + L.x * A.u[1] + L.y * A.v[1] + F.lotTop * A.w[1];
+      const ux = L.w * A.u[0], uy = L.w * A.u[1], vx = L.h * A.v[0], vy = L.h * A.v[1];
+      const on = ox + Math.max(0, ux) + Math.max(0, vx) > -80 && ox + Math.min(0, ux) + Math.min(0, vx) < R.W + 80 && oy + Math.max(0, uy) + Math.max(0, vy) > -80 && oy + Math.min(0, uy) + Math.min(0, vy) < R.H + 80;
       if (!on && !forced.has(F.id)) continue;
       const short = Math.min(V.ul * F.lot.w, V.vl * F.lot.h);
       const open = forced.has(F.id) || short >= OPEN_AT || (C.open.has(F.id) && short >= CLOSE_AT);
@@ -901,8 +903,11 @@ export function makeCity(env) {
     };
     const take = (x, y, w, h) => { for (let gx = Math.floor(x / cell); gx <= Math.floor((x + w) / cell); gx++) for (let gy = Math.floor(y / cell); gy <= Math.floor((y + h) / cell); gy++) gridSet.add(gx * 4096 + gy); count++; };
     const onScreen = (p) => p[0] > -40 && p[1] > -20 && p[0] < R.W + 40 && p[1] < R.H + 20;
+    // Labels stay clear of the top bar and the screen's edges.
+    const topY = env.viewport().y - 4;
+    const clear = (x, y, w) => y > topY && x >= 2 && x + w <= R.W - 2;
     // Signs carry file names, with the staged glyph.
-    const files = [...C.lay.files.values()].sort((a, b) => b.lot.w * b.lot.h - a.lot.w * a.lot.h);
+    const files = C.lay.bySize ??= [...C.lay.files.values()].sort((a, b) => b.lot.w * b.lot.h - a.lot.w * a.lot.h);
     for (const F of files) {
       if (count >= 400) break;
       const s = F.sign;
@@ -912,7 +917,7 @@ export function makeCity(env) {
       const p = proj(A, s.x + s.w / 2, s.y + s.h / 2, top);
       if (!onScreen(p) || hidden(s.x + s.w / 2, s.y + s.h / 2, top)) continue;
       const n = T.N[F.id];
-      const size = clamp(V.vl * s.h * 0.55, 9.5, 14);
+      const size = env.fontSize(V.vl * s.h * 0.55, 9.5, 14);
       ctx.font = `600 ${size}px ${env.UI_FONT}`;
       const st = env.stageOf(F.id);
       const glyph = st ? ` ${{ add: '+', edit: '~', delete: '−' }[st]}` : '';
@@ -920,7 +925,7 @@ export function makeCity(env) {
       if (!text) continue;
       const w = env.textWidth(ctx, text);
       const lx = p[0] - w / 2;
-      if (!free(lx, p[1] - size / 2, w, size)) continue;
+      if (!clear(lx, p[1] - size / 2, w) || !free(lx, p[1] - size / 2, w, size)) continue;
       take(lx, p[1] - size / 2, w, size);
       env.haloText(ctx, text, lx, p[1], C.faint?.(F.id) ? th.ink3 : th.ink, th);
     }
@@ -939,7 +944,7 @@ export function makeCity(env) {
       const text = env.fitText(ctx, `${n.form === 'ctor' ? 'new' : n.form ?? n.kind} ${n.name}`, Math.min(V.ul * b.w - 10, 200));
       if (!text) continue;
       const w = env.textWidth(ctx, text);
-      if (!free(p[0] + 3, p[1] + 2, w + 10, 16)) continue;
+      if (!clear(p[0] + 3, p[1] + 2, w + 10) || !free(p[0] + 3, p[1] + 2, w + 10, 16)) continue;
       take(p[0] + 3, p[1] + 2, w + 10, 16);
       ctx.fillStyle = th.halo;
       ctx.beginPath();
@@ -949,7 +954,7 @@ export function makeCity(env) {
       ctx.fillText(text, p[0] + 8, p[1] + 10.5);
     }
     // District names at the plinth's front-left corner.
-    const dirs = C.lay.items.filter((b) => b.part === 'dir' && T.depth[b.id] <= 3).sort((a, b) => T.depth[a.id] - T.depth[b.id] || b.w * b.h - a.w * a.h);
+    const dirs = C.lay.districts ??= C.lay.items.filter((b) => b.part === 'dir' && T.depth[b.id] <= 3).sort((a, b) => T.depth[a.id] - T.depth[b.id] || b.w * b.h - a.w * a.h);
     for (const b of dirs) {
       if (count >= 400) break;
       const top = b.z + b.d;
@@ -961,7 +966,7 @@ export function makeCity(env) {
       ctx.font = `650 ${size}px ${env.UI_FONT}`;
       const text = env.fitText(ctx, n.kind === 'repo' && n.branch ? `${n.name} · ${n.branch}` : n.name, 180);
       const w = env.textWidth(ctx, text);
-      if (!free(p[0], p[1] - 8, w, 16) || hidden(b.x + b.w * 0.02, b.y + b.h * 0.02, top)) continue;
+      if (!clear(p[0], p[1] - 8, w) || !free(p[0], p[1] - 8, w, 16) || hidden(b.x + b.w * 0.02, b.y + b.h * 0.02, top)) continue;
       take(p[0], p[1] - 8, w, 16);
       env.haloText(ctx, text, p[0], p[1], C.faint?.(b.id) ? th.ink3 : th.ink, th);
     }
