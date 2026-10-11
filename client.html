@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="devibe: see, check, and reshape codebases.">
+  <title>devibe</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='2' y='2' width='28' height='28' rx='7' fill='%23161615'/%3E%3Crect x='7' y='7' width='10' height='18' rx='2' fill='%233987e5'/%3E%3Crect x='19' y='7' width='6' height='8' rx='2' fill='%23d95926'/%3E%3Crect x='19' y='17' width='6' height='8' rx='2' fill='%23199e70'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/client.css">
+  <script src="/lib/d3.js"></script>
+  <script type="importmap">{ "imports": { "three": "/lib/three/three.module.js", "three/addons/": "/lib/three/addons/" } }</script>
+  <script type="module" src="/client.mjs"></script>
+</head>
+<body>
+  <main id="view" aria-label="Code map. Scroll or pinch to zoom, drag to pan.">
+    <canvas id="gl"></canvas>
+    <canvas id="ink"></canvas>
+  </main>
+
+  <header id="bar">
+    <button id="brand" class="brand" title="Open a folder (O)"><span class="mark"></span><b>devibe</b></button>
+    <nav id="crumbs" aria-label="Location"></nav>
+    <div id="find" class="find">
+      <input id="find-box" type="search" placeholder="Find files, symbols, text" autocomplete="off" spellcheck="false" aria-label="Find">
+      <kbd>/</kbd>
+      <div id="find-list" class="find-list" role="listbox" hidden></div>
+    </div>
+    <div id="tools" class="tools"></div>
+  </header>
+
+  <aside id="dock" class="panel dock" aria-label="Check and change"></aside>
+  <aside id="info" class="panel info" aria-label="Details" hidden></aside>
+
+  <footer id="foot">
+    <div id="legend" class="legend"></div>
+    <div id="status" class="status"></div>
+  </footer>
+
+  <nav id="tabs" class="tabs" aria-label="Panels"></nav>
+
+  <section id="diff" class="sheet diff" hidden></section>
+  <section id="ask" class="pop" hidden></section>
+  <div id="tip" class="tip" hidden></div>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+
+  <dialog id="open-box" class="box"></dialog>
+  <dialog id="setup-box" class="box"></dialog>
+  <dialog id="keys-box" class="box"></dialog>
+</body>
+</html>
