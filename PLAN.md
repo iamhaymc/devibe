@@ -1,6 +1,6 @@
 # Plan: City 2.0, Sets, and one Act workflow
 
-Status: proposal. Touches `client.mjs` (plus two new client modules), `server.mjs`, `client.css`, `client.html`, tests, and docs.
+Status: implemented (phases 0–6). The optional notes feature in Phase 6 is left out and listed in TODO.md. DESIGN.md is the reference for what shipped. Touches `client.mjs` (plus two new client modules), `server.mjs`, `client.css`, `client.html`, tests, and docs.
 
 ## Contents
 

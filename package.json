@@ -9,8 +9,8 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test server.test.mjs client.test.mjs",
-    "test:server": "node --test server.test.mjs",
+    "test": "node --test server.test.mjs sets.test.mjs client.test.mjs",
+    "test:server": "node --test server.test.mjs sets.test.mjs",
     "test:client": "node --test client.test.mjs"
   },
   "engines": {
