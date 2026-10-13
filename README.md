@@ -33,7 +33,7 @@ Every view is in [`test/shots/`](test/shots).
 
 ## Quickstart
 
-Needs Node.js 20+ and git.
+Needs Node.js 20+ and git. `util/setup.sh` (Mac/Linux) or `util/setup.ps1` (Windows) installs nvm and uses it to install Node.js LTS, alongside uv, Python 3.12 and clang.
 
 ```sh
 npm install
