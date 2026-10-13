@@ -1,28 +1,35 @@
-# devibe
+<table>
+<tbody>
+<tr>
+<td><img src="./data/_brand/logo_1.svg" width="64px"/></td>
+<td><h1 style="color:#234;">DEVIBE</h1></td>
+</tr>
+</tbody>
+</table>
 
 See how a codebase is built, check it for problems, and reshape it — fast, even when most of it was generated and nobody has read it yet.
 
 devibe scans one or more local repos and draws them as one zoomable, GPU-rendered map: folders hold files, files hold types and functions, and zooming in turns colored blocks into real, highlighted code. The same map stands up as a 3D city where each function is a tower over its own code, and the code sits on the roofs. Links show what uses what, down to the line. Checks flag the usual debris of generated code (copies, loops, stubs, secrets, unused code, versioned names, files that always change together). Select anything — parts, links, line ranges, a legend color, a query — and the Act bar offers what fits: explain, tidy, split, fix, test, document, decouple, merge, extract. Every edit is staged so you review a diff before anything touches disk.
 
-![Map](shots/02-map.png)
+![Map](test/shots/02-map.png)
 
 | Read code in place | Check findings | Reshape with the agent |
 | --- | --- | --- |
-| ![Code](shots/04-code.png) | ![Check](shots/15-check.png) | ![Agent](shots/17-agent.png) |
+| ![Code](test/shots/04-code.png) | ![Check](test/shots/15-check.png) | ![Agent](test/shots/17-agent.png) |
 
 | City | Code on the roofs | Links in 3D |
 | --- | --- | --- |
-| ![City](shots/30-city-open.png) | ![Reading in City](shots/31-city-read.png) | ![City links](shots/33-city-links.png) |
+| ![City](test/shots/30-city-open.png) | ![Reading in City](test/shots/31-city-read.png) | ![City links](test/shots/33-city-links.png) |
 
 | A link and where it happens | Grow the set | Act one by one |
 | --- | --- | --- |
-| ![Link](shots/34-link-select.png) | ![Grow](shots/35-grow.png) | ![One by one](shots/39-act-each.png) |
+| ![Link](test/shots/34-link-select.png) | ![Grow](test/shots/35-grow.png) | ![One by one](test/shots/39-act-each.png) |
 
 | Code sheet | Layers | Phone |
 | --- | --- | --- |
-| ![Code sheet](shots/40-code-edit.png) | ![Layers](shots/10-layers.png) | ![Phone](shots/44-phone-act.png) |
+| ![Code sheet](test/shots/40-code-edit.png) | ![Layers](test/shots/10-layers.png) | ![Phone](test/shots/44-phone-act.png) |
 
-Every view is in [`shots/`](shots).
+Every view is in [`test/shots/`](test/shots).
 
 ## Quickstart
 
@@ -30,10 +37,10 @@ Needs Node.js 20+ and git.
 
 ```sh
 npm install
-node server.mjs ~/code/my-repo ~/code/other-repo --open
+node app/server.mjs ~/code/my-repo ~/code/other-repo --open
 ```
 
-Then open http://127.0.0.1:4747. No repo handy? `node server.mjs --demo` opens a small sample shop with planted problems.
+Then open http://127.0.0.1:4747. No repo handy? `node app/server.mjs --demo` opens a small sample shop with planted problems.
 
 ### Set up the agent
 
@@ -43,7 +50,7 @@ Any OpenAI-compatible endpoint works. For OpenRouter:
 export DEVIBE_ENDPOINT=https://openrouter.ai/api/v1
 export DEVIBE_MODEL=deepseek/deepseek-v4.1-flash   # any model that supports tool calls
 export DEVIBE_API_KEY=sk-or-...
-node server.mjs ~/code/my-repo
+node app/server.mjs ~/code/my-repo
 ```
 
 Or set them in **Settings** in the app (saved to `~/.devibe/config.json`). Check the exact model name on your provider's model list.
@@ -68,7 +75,7 @@ Press `?` in the app for all keys.
 ```sh
 npm test               # every suite
 npm run test:server    # unit tests (parsing, checks, stage, sockets, agent loop, sets)
-npm run test:client    # browser tests and workflows; rewrites the images in shots/
+npm run test:client    # browser tests and workflows; rewrites the images in test/shots/
 ```
 
 The browser tests use Playwright's Chromium. Run `npx playwright install chromium` once if it is missing.

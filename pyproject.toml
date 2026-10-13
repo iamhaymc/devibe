@@ -1,0 +1,32 @@
+[project]
+name = "devibe"
+version = "0.1.0"
+description = "Yet another repository editor"
+requires-python = ">=3.12"
+dependencies = [
+    "jinja2",
+    "python-dotenv",
+    "omegaconf",
+    "websockets",
+    "openai",
+    "openai-agents",
+    "cachetools",
+    "transformers @ git+https://github.com/huggingface/transformers",
+    "accelerate",
+    "lighteval",
+    "pillow",
+    "ipykernel"
+]
+
+[project.optional-dependencies]
+e2e = ["playwright"]
+
+[project.scripts]
+agentic = "agent:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true

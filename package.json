@@ -5,13 +5,13 @@
   "type": "module",
   "private": true,
   "bin": {
-    "devibe": "server.mjs"
+    "devibe": "app/server.mjs"
   },
   "scripts": {
-    "start": "node server.mjs",
-    "test": "node --test server.test.mjs sets.test.mjs client.test.mjs",
-    "test:server": "node --test server.test.mjs sets.test.mjs",
-    "test:client": "node --test client.test.mjs"
+    "start": "node app/server.mjs",
+    "test": "node --test test/server.test.mjs test/sets.test.mjs test/client.test.mjs",
+    "test:server": "node --test test/server.test.mjs test/sets.test.mjs",
+    "test:client": "node --test test/client.test.mjs"
   },
   "engines": {
     "node": ">=20"

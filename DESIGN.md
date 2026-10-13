@@ -1,4 +1,4 @@
-# devibe design
+# ⏬ Devibe — Design
 
 devibe helps you understand, audit, and reshape codebases that grew faster than anyone could read them. This document is the complete reference: what each part does, how it works, and every option, message, rule, and limit.
 
@@ -36,28 +36,28 @@ devibe helps you understand, audit, and reshape codebases that grew faster than 
 │ hub ── message handlers ── state             │  JSON  │ Workspace                         │
 │  │                                           │◀──────▶│  repos → scan → facts (cached)    │
 │  ├─ three.js: tiles, links (WebGL)           │   WS   │  buildModel → nodes, links, issues│
-│  ├─ city.mjs: boxes, skyline, roofs, skyways │        │  Stage (pending edits, undo)      │
+│  ├─ core_city.mjs: boxes, skyline, skyways   │        │  Stage (pending edits, undo)      │
 │  ├─ Canvas 2D "ink": labels, code, outlines  │        │  Ledger (reviews, waivers, sets)  │
 │  ├─ d3: layouts, zoom, scales, transitions   │        │  Agent (acts, tools, set prompts) │
-│  ├─ sets.mjs: index, grow, queries, recipes  │        │  sets.mjs (the same module)       │
+│  ├─ core_sets.mjs: index, grow, queries      │        │  core_sets.mjs (the same module)  │
 │  └─ DOM: bar, Check, Change, Selection, Act  │        │                                   │
 └──────────────────────────────────────────────┘        └───────────────────────────────────┘
 ```
 
-Files:
+Files (source in `app/`, tests and screenshots in `test/`):
 
 | File | Role |
 | --- | --- |
-| `server.mjs` | CLI, HTTP static server, WebSocket protocol, scanner, parsers, model, checks, diff, stage, ledger, agent, demo repo. |
-| `server.test.mjs` | Unit tests with `node:test`. Includes a mock OpenAI-compatible endpoint. |
-| `client.html` | Page shell: canvases, bar, panels, Act bar, Code sheet, dialogs. Loads d3 and three.js from `node_modules` through the server. |
-| `client.css` | Theme tokens (dark, light, system), layout, panels, responsive rules. |
-| `client.mjs` | Hub, state, wire, Map, Graph, Layers, tile renderer, 2D ink, picking, panels, Act bar, Code sheet, keys. |
-| `force.mjs` | The Graph force layout. Runs in place for small graphs and as a module worker (`force.mjs?worker`) for large ones. |
-| `city.mjs` | City: box shader, open-building planner, skyline index (picking and occlusion), orbit and pivot, labels, roof code, skyways, hull outlines, isolate and cutaway. `makeCity(env)` takes the client's state and helpers. |
-| `sets.mjs` | The set core, with no DOM, d3, or three.js: model index, lifting, strongly connected groups and levels, grow operations, set boundary, Find queries, color classes, recipe replay. Shared by the client and the server. |
-| `sets.test.mjs` | Unit tests for `sets.mjs` on the demo model. |
-| `client.test.mjs` | Playwright tests that drive every feature and save screenshots to `shots/`, plus the workflow tests. |
+| `app/server.mjs` | CLI, HTTP static server, WebSocket protocol, scanner, parsers, model, checks, diff, stage, ledger, agent, demo repo. |
+| `test/server.test.mjs` | Unit tests with `node:test`. Includes a mock OpenAI-compatible endpoint. |
+| `app/client.html` | Page shell: canvases, bar, panels, Act bar, Code sheet, dialogs. Loads d3 and three.js from `node_modules` through the server. |
+| `app/client.css` | Theme tokens (dark, light, system), layout, panels, responsive rules. |
+| `app/client.mjs` | Hub, state, wire, Map, Graph, Layers, tile renderer, 2D ink, picking, panels, Act bar, Code sheet, keys. |
+| `app/core_force.mjs` | The Graph force layout. Runs in place for small graphs and as a module worker (`core_force.mjs?worker`) for large ones. |
+| `app/core_city.mjs` | City: box shader, open-building planner, skyline index (picking and occlusion), orbit and pivot, labels, roof code, skyways, hull outlines, isolate and cutaway. `makeCity(env)` takes the client's state and helpers. |
+| `app/core_sets.mjs` | The set core, with no DOM, d3, or three.js: model index, lifting, strongly connected groups and levels, grow operations, set boundary, Find queries, color classes, recipe replay. Shared by the client and the server. |
+| `test/sets.test.mjs` | Unit tests for `core_sets.mjs` on the demo model. |
+| `test/client.test.mjs` | Playwright tests that drive every feature and save screenshots to `test/shots/`, plus the workflow tests. |
 | `package.json` | Dependencies and scripts. |
 
 Dependencies: `ws` (WebSocket server), `@openai/agents` and `openai` (agent), `d3` and `three` (served to the browser), `playwright` (tests).
@@ -67,7 +67,7 @@ Dependencies: `ws` (WebSocket server), `@openai/agents` and `openai` (agent), `d
 ### Command line
 
 ```
-node server.mjs [folders...] [--port 4747] [--host 127.0.0.1] [--open] [--demo] [--no-watch]
+node app/server.mjs [folders...] [--port 4747] [--host 127.0.0.1] [--open] [--demo] [--no-watch]
 ```
 
 | Option | Meaning |
@@ -188,7 +188,7 @@ The client is message-driven. `hub.emit(type, data)` runs every handler register
 | Layer | Technology | Draws |
 | --- | --- | --- |
 | Tiles | three.js `InstancedBufferGeometry` with a custom shader | Every rectangle and circle in Map, Graph, and Layers: one instance each, with a signed-distance rounded box, antialiased edges, inner edge shading, and zoom-aware fading of file bodies as code becomes readable. Hundreds of thousands of tiles in one draw call. |
-| City boxes | three.js `InstancedBufferGeometry` box with a custom shader (`city.mjs`) | Plinths, lots, signs, podiums, towers, and shells. Each instance carries its previous and next geometry, so a morph costs one uniform per frame. Hemisphere and directional light, screen-space edge darkening, a brighter top when hovered. Two passes over one geometry: opaque, then ghosts (transparent, no depth write). |
+| City boxes | three.js `InstancedBufferGeometry` box with a custom shader (`core_city.mjs`) | Plinths, lots, signs, podiums, towers, and shells. Each instance carries its previous and next geometry, so a morph costs one uniform per frame. Hemisphere and directional light, screen-space edge darkening, a brighter top when hovered. Two passes over one geometry: opaque, then ghosts (transparent, no depth write). |
 | Links | three.js `LineSegments2` (fat, antialiased screen-space lines) | Links as sampled curves with a dim-to-bright gradient from source to target, one group per line width, in three layers that rebuild only when their inputs change: the base (every link in All, or the faint backdrop of Graph and Layers), the set (its boundary and picked links), and the hover. Routes are cached per layout, and the last few base and hover layers are kept, so hovering and selecting never re-route the base. The sampled polylines are kept for picking; each bright link also keeps its arrowhead point and direction. |
 | Ink | Canvas 2D on top of WebGL | Text and outlines with native font rendering: labels, code minimaps, code text, call-site marks, issue markers, arrowheads, selection and hover outlines, drag ghost, and in City the code on the roofs. Only what is visible and large enough is drawn. |
 
@@ -275,7 +275,7 @@ At reading zoom the gutter shows **call sites**: `→` on lines that use somethi
 | Changes | Staged new, staged edit, staged delete, uncommitted in git | Green, blue, red, dim yellow. |
 | Reach | Hops from the set: through what it uses, through what uses it, or both | Blue steps 1, 2, 3+; orange steps 1, 2, 3+; violet for both; the set in the accent color. |
 
-The legend is a control: clicking a color selects every part with that color at the current Detail (Shift adds), and dragging across a gradient selects a range while a tip shows the range and how many parts it holds. Painting and selecting share one function, `classify` in `sets.mjs`, so they always agree.
+The legend is a control: clicking a color selects every part with that color at the current Detail (Shift adds), and dragging across a gradient selects a range while a tip shows the range and how many parts it holds. Painting and selecting share one function, `classify` in `core_sets.mjs`, so they always agree.
 
 The palette is a validated colorblind-safe categorical set with separate dark and light steps, a single-hue sequential ramp, and reserved status colors that always come with a label or shape (diamond high, square medium, circle low).
 
@@ -584,7 +584,7 @@ The first six are read tools; the last four are write tools. Paths start with th
 
 `sets.test.mjs` (`node --test`, no browser) runs on the demo model: the index, parts at a rank, lifted graphs without copies or changes-with, levels, grow out and in with hops, path, loop, copies, tests, inside, the boundary, reach, used by, query parsing with help for bad input, every filter, `classify` for every color with matching legend picks, link member expansion, and recipe replay on a rebuilt model.
 
-`client.test.mjs` (Playwright, `node --test`) starts a server with no repos and a mock model, then drives the UI like a user and saves one image per step to `shots/`:
+`client.test.mjs` (Playwright, `node --test`) starts a server with no repos and a mock model, then drives the UI like a user and saves one image per step to `test/shots/`:
 
 | Image | Shows |
 | --- | --- |
@@ -639,7 +639,7 @@ The tests also fail on any script error in the page.
 Names are short, plain, and paired so related things read alike:
 
 - Messages are `noun.verb`: `repo.open`/`repo.shut`, `stage.apply`/`stage.undo`, `pick.set`/`pick.clear`, `code.open`/`code.close`, `set.save`/`set.drop`.
-- Functions pair a short verb with a noun: `readFacts`, `readSymbols`, `readImports`; `layMap`, `layGraph`, `layLayers`; `drawBar`, `drawDock`, `drawSelection`, `drawAct`, `drawCode`, `drawFoot`; `inkMap`, `inkFile`, `inkCode`; `pickAt`, `pickLink`, `flyTo`, `fitAll`; `showTip`/`hideTip`; in `sets.mjs`, `grow`, `boundary`, `classify`, `replay`; in `city.mjs`, `plan`, `skyBuild`, `walkLine`, `roofs`.
+- Functions pair a short verb with a noun: `readFacts`, `readSymbols`, `readImports`; `layMap`, `layGraph`, `layLayers`; `drawBar`, `drawDock`, `drawSelection`, `drawAct`, `drawCode`, `drawFoot`; `inkMap`, `inkFile`, `inkCode`; `pickAt`, `pickLink`, `flyTo`, `fitAll`; `showTip`/`hideTip`; in `core_sets.mjs`, `grow`, `boundary`, `classify`, `replay`; in `core_city.mjs`, `plan`, `skyBuild`, `walkLine`, `roofs`.
 - UI words: Map, Graph, Layers, City; Check, Change, Selection; Find; Detail, Color, Height, Links; the set, Act bar, Code sheet; Grow, Isolate, Freeze; Apply, Discard, Undo, Preview.
 - Rule names are two plain words: Big files, Long functions, Copied code, Import loops.
 

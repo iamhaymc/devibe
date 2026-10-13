@@ -1,0 +1,98 @@
+{
+  "chat.newSession.defaultMode": "agent",
+  // "chat.defaultModel": "huihui_ai/Qwen3.8-abliterated:27b (ollama-models)",
+  "chat.agentHost.copilot.reasoningEffortOverride": "high",
+  "github.copilot.chat.reasoningEffortOverride": "high",
+  "chat.agent.maxRequests": 1000,
+  "chat.defaultConfiguration": {
+    "mode": "interactive",
+    "approvals": "allowAll"
+  },
+  "chat.permissions.default": "autoApprove",
+  "chat.editing.autoAcceptDelay": 0,
+  "chat.agent.thinkingStyle": "fixedScrolling",
+  "chat.useAgentSkills": true,
+  "chat.useAgentsMdFile": true,
+  "chat.useNestedAgentsMdFiles": false,
+  "chat.useClaudeMdFile": false,
+  "chat.useClaudeHooks": false,
+  "chat.useHooks": false,
+  "chat.agentHost.byokModels.enabled": true,
+  "chat.byokUtilityModelDefault": "mainAgent",
+  "git.confirmSync": false,
+  "git.enableSmartCommit": true,
+  "[python]": {
+    "editor.tabSize": 4,
+    "editor.defaultFormatter": "ms-python.black-formatter"
+  },
+  "black-formatter.args": [
+    "--line-length",
+    "200"
+  ],
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestEnabled": true,
+  "python.testing.pytestArgs": [
+    "tests"
+  ],
+  "[javascript]": {
+    "editor.defaultFormatter": "vscode.typescript-language-features"
+  },
+  "[typescript]": {
+    "editor.defaultFormatter": "vscode.typescript-language-features"
+  },
+  "[html]": {
+    "editor.defaultFormatter": "vscode.html-language-features"
+  },
+  "[yaml]": {
+    "editor.defaultFormatter": "redhat.vscode-yaml",
+    "editor.autoIndent": "keep",
+    "diffEditor.ignoreTrimWhitespace": false,
+    "editor.defaultColorDecorators": "auto",
+    "editor.quickSuggestions": {
+      "strings": true,
+      "other": true,
+      "comments": false
+    }
+  },
+  "yaml.validate": true,
+  "yaml.customTags": [
+    "!And",
+    "!Base64",
+    "!Cidr",
+    "!Condition",
+    "!Equals",
+    "!FindInMap",
+    "!GetAtt",
+    "!If",
+    "!ImportValue",
+    "!Include",
+    "!Join",
+    "!Not",
+    "!Or",
+    "!Ref",
+    "!Select",
+    "!Split",
+    "!Sub",
+    "!Transform"
+  ],
+  "editor.fontFamily": "'SF Mono', 'Cascadia Code', 'Consolas', monospace",
+  "editor.fontSize": 12.4,
+  "terminal.integrated.fontFamily": "'SF Mono', 'Cascadia Code', 'Consolas', monospace",
+  "terminal.integrated.fontSize": 13,
+  "workbench.iconTheme": "vs-seti",
+  "workbench.colorTheme": "GitHub Dark Dimmed",
+  "explorer.compactFolders": false,
+  "editor.minimap.enabled": false,
+  "editor.bracketPairColorization.enabled": false,
+  "editorconfig.generateAuto": false,
+  "editor.detectIndentation": true,
+  "editor.insertSpaces": true,
+  "editor.tabSize": 2,
+  "files.exclude": {
+    "**/.venv": true,
+    "**/__pycache__": true,
+    "**/uv.lock": true,
+    "**/node_modules": true,
+    "**/package-lock.json": true
+  }
+}
