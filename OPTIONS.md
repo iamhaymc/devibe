@@ -1,4 +1,4 @@
-# ⏬ Devibe — Options
+# ⏬ DEVIBE — Options
 
 Environment variables may also be set in a `.env` file (cwd, then beside `agent.py`); the file wins over variables already set in the shell.
 

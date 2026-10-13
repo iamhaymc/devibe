@@ -1,4 +1,4 @@
-# ⏬ Devibe — Design
+# ⏬ DEVIBE — Design
 
 devibe helps you understand, audit, and reshape codebases that grew faster than anyone could read them. This document is the complete reference: what each part does, how it works, and every option, message, rule, and limit.
 
