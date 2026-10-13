@@ -144,47 +144,6 @@ export function gutterRoute(x, ya, yb, { min = 1, max = 3, steps = 24 } = {}) {
   return sample([[x, ya], [x - reach, ya], [x - reach, yb], [x, yb]], steps);
 }
 
-// A uniform cubic B-spline through clamped ends, `count` points.
-function spline(P, count) {
-  const E = [P[0], P[0], ...P, P.at(-1), P.at(-1)];
-  const segs = E.length - 3;
-  const out = [];
-  for (let s = 0; s < count; s++) {
-    const u = (s / (count - 1)) * segs;
-    const k = Math.min(segs - 1, Math.floor(u));
-    const t = u - k, t2 = t * t, t3 = t2 * t;
-    const b0 = (1 - t) ** 3 / 6, b1 = (3 * t3 - 6 * t2 + 4) / 6, b2 = (-3 * t3 + 3 * t2 + 3 * t + 1) / 6, b3 = t3 / 6;
-    const [p0, p1, p2, p3] = [E[k], E[k + 1], E[k + 2], E[k + 3]];
-    out.push([b0 * p0[0] + b1 * p1[0] + b2 * p2[0] + b3 * p3[0], b0 * p0[1] + b1 * p1[1] + b2 * p2[1] + b3 * p3[1]]);
-  }
-  out[0] = [...P[0]];
-  out[count - 1] = [...P.at(-1)];
-  return out;
-}
-
-// Map, many links: from box A to box B by way of the folders between them.
-// `outA` lists A's folders from its own up to the one just below the folder
-// both share; `inB` lists B's folders from just below the shared folder down
-// to its own. The link crosses each folder's border where the line between
-// the two sides' top folders does, so links between the same two folders
-// bundle where they leave and enter them, and never detour through the middle
-// of a folder. Crossings are pulled toward the straight line by 1 − beta.
-export function bundleRoute(A, B, outA, inB, { beta = 0.9, bend = 0.25, steps } = {}) {
-  if (!outA.length && !inB.length) return boxRoute(A, B);
-  const ta = mid(outA.at(-1) ?? A), tb = mid(inB[0] ?? B);
-  const hubs = [...outA.map((r) => exitOf(r, tb).p), ...inB.map((r) => exitOf(r, ta).p)];
-  const ea = exitOf(A, hubs[0]), eb = exitOf(B, hubs.at(-1));
-  const d = Math.hypot(eb.p[0] - ea.p[0], eb.p[1] - ea.p[1]);
-  const h = Math.min(bend * d, Math.max(A.w, A.h, B.w, B.h));
-  const n = hubs.length + 1;
-  const pull = hubs.map((q, i) => {
-    const t = (i + 1) / n;
-    return [beta * q[0] + (1 - beta) * (ea.p[0] + (eb.p[0] - ea.p[0]) * t), beta * q[1] + (1 - beta) * (ea.p[1] + (eb.p[1] - ea.p[1]) * t)];
-  });
-  const P = [ea.p, [ea.p[0] + ea.n[0] * h, ea.p[1] + ea.n[1] * h], ...pull, [eb.p[0] + eb.n[0] * h, eb.p[1] + eb.n[1] * h], eb.p];
-  return spline(P, steps ?? Math.max(24, P.length * 8));
-}
-
 // Code to elsewhere: a code end (sides 'h') in file box FA leaves beside its
 // line and runs level to FA's edge before it curves away, so links from one
 // line share one trunk instead of fanning across the code beside it. FB does

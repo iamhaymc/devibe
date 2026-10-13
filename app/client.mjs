@@ -9,17 +9,23 @@ import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import * as S from './core_sets.mjs';
 import { makeCity } from './core_city.mjs';
 import { simulate } from './core_force.mjs';
-import { arcRoute, layerRoute, boxRoute, gutterRoute, bundleRoute, codeRoute } from './core_route.mjs';
+import { arcRoute, layerRoute, boxRoute, gutterRoute, codeRoute } from './core_route.mjs';
 
 const d3 = window.d3;
 
 // ───────────────────────────── Vocabulary ─────────────────────────────
 
 const LAYOUTS = [
-  { id: 'map', name: 'Map', key: '1', about: 'Folders, files, and code, nested and sized by lines.' },
-  { id: 'graph', name: 'Graph', key: '2', about: 'Parts pulled together by their links.' },
-  { id: 'layers', name: 'Layers', key: '3', about: 'Parts stacked by dependency. Base code sits at the bottom.' },
-  { id: 'city', name: 'City', key: '4', about: 'The map in 3D. Buildings open into towers (functions) on podiums (types) as you zoom in; the code is on the roofs.' },
+  { id: 'map', name: 'Map', icon: 'map', key: '1', about: 'Folders, files, and code, nested and sized by lines.' },
+  { id: 'graph', name: 'Graph', icon: 'graph', key: '2', about: 'Parts pulled together by their links.' },
+  { id: 'layers', name: 'Layers', icon: 'layers', key: '3', about: 'Parts stacked by dependency. Base code sits at the bottom.' },
+  { id: 'city', name: 'City', icon: 'city', key: '4', about: 'The map in 3D. Buildings open into towers (functions) on podiums (types) as you zoom in; the code is on the roofs.' },
+];
+// The dock's panels; each has a toggle in the bar (on phones, a bottom tab).
+const PANELS = [
+  { id: 'view', name: 'View', about: 'Layout, color, detail, and links' },
+  { id: 'check', name: 'Check', about: 'Findings and review progress' },
+  { id: 'change', name: 'Change', about: 'Staged changes and the agent' },
 ];
 const PAINTS = [
   { id: 'lang', name: 'Language' },
@@ -90,8 +96,6 @@ const THEMES = {
   },
 };
 const LINK_COLOR = { out: 0, in: 1, inside: 6, import: 0, call: 2, use: 6, base: 3, copy: 4 };
-// Line widths per kind, in pixels; changes-with links are thin and faint.
-const LINK_WIDTH = { import: 2.2, call: 2.4, use: 1.9, base: 2.8, copy: 1.9, change: 1.4 };
 const TK = { txt: 0, kw: 1, str: 2, num: 3, com: 4, type: 5, fn: 6, pun: 7 };
 
 const UI_FONT = 'Inter, "SF Pro Text", -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
@@ -106,6 +110,10 @@ const ICONS = {
   info: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 11v5.5M12 7.8v.1',
   view: 'M12 3.5l8.5 4.5-8.5 4.5L3.5 8zM3.5 12.5l8.5 4.5 8.5-4.5M3.5 16.5l8.5 4.5 8.5-4.5',
   close: 'M6.5 6.5l11 11M17.5 6.5l-11 11',
+  map: 'M6 4h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zM11 4v16M11 11h9M15.5 11v9',
+  graph: 'M3.5 6a2.5 2.5 0 1 0 5 0a2.5 2.5 0 1 0-5 0M15.5 9a2.5 2.5 0 1 0 5 0a2.5 2.5 0 1 0-5 0M7.5 18a2.5 2.5 0 1 0 5 0a2.5 2.5 0 1 0-5 0M8.4 6.6l7.2 1.8M6.8 8.4l2.4 7.2M16.3 10.9l-4.6 5.2',
+  layers: 'M4 4h6v4H4zM14 4h6v4h-6zM8 10h8v4H8zM4 16h16v4H4z',
+  city: 'M3 20h18M5 20v-8h4v8M10 20V5h5v15M12.5 5V3M16 20v-6h3.5v6',
   fit: 'M4 9V5h4M20 9V5h-4M4 15v4h4M20 15v4h-4',
   undo: 'M9 14L4.5 9.5 9 5M4.5 9.5H14a5.5 5.5 0 0 1 0 11h-3',
   up: 'M12 19V5M6 11l6-6 6 6',
@@ -203,6 +211,9 @@ const state = {
   detail: store.load('detail', 'file'),
   theme: store.load('theme', 'dark'),
   dock: store.load('dock', 'check'),
+  // The Selection panel's toggle (wide screens): 'auto' shows it while the set
+  // has members, 'open' always, 'shut' never (until toggled again).
+  info: store.load('info', 'auto'),
   kinds: store.load('kinds', {}),
   height: store.load('height', 'same'),
   mode: store.load('mode', 'together'),
@@ -827,7 +838,7 @@ function setupGL() {
   city.attach();
   // Compile every shader now (City's and the links' too, though hidden), so
   // the first switch to a layout never stalls on a compile.
-  const warm = new LineSegments2(new LineSegmentsGeometry(), lineMat(LINK_WIDTH.call));
+  const warm = new LineSegments2(new LineSegmentsGeometry(), lineMat(4));
   links.add(warm);
   // A program's first use checks its compile log, which waits for the GPU to
   // finish everything queued; do that here too, while the queue is empty.
@@ -1262,7 +1273,7 @@ function routeOf(e) {
   }
   const cache = !e.sa && !e.sb ? (lay.routes ??= new Map()) : null;
   const fine = (id) => (lay.kind === 'map' && state.T.fileOf[id] !== id && readable(state.T.fileOf[id]) ? 'r' : '');
-  const key = cache && `${e.a}>${e.b}${e.dir ? '' : '~'}${fine(e.a)}${fine(e.b)}`;
+  const key = cache && `${e.a}>${e.b}${fine(e.a)}${fine(e.b)}`;
   if (cache?.has(key)) return cache.get(key);
   const pts = routeOf2d(e, lay);
   const out = pts ? flatPts(pts) : null;
@@ -1273,8 +1284,7 @@ function routeOf(e) {
 // Every flat route runs from the source's edge to the target's edge
 // (core_route.mjs). Map: two lines of one code column join through the
 // gutter; a code line linked to another file runs level to its file's edge
-// first; set and hover links go straight between their boxes; All bundles
-// where links cross the borders of the folders between the ends.
+// first; other links go straight between their boxes, in Focus and All alike.
 function routeOf2d(e, lay) {
   if (lay.kind === 'map') {
     const A = endBox(e.a, e.sa), B = endBox(e.b, e.sb);
@@ -1282,13 +1292,7 @@ function routeOf2d(e, lay) {
     if (A.sides && B.sides && A.file === B.file && A.col === B.col) return A.y === B.y ? null : gutterRoute(A.x, A.y + A.h / 2, B.y + B.h / 2, { min: A.h * 0.9, max: A.h * 1.8 });
     const FA = A.sides && A.file !== B.file ? lay.rect.get(A.file) : null, FB = B.sides && B.file !== A.file ? lay.rect.get(B.file) : null;
     if (FA || FB) return codeRoute(A, B, FA, FB);
-    if (e.dir) return boxRoute(A, B);
-    const pa = pathOf(e.a), pb = pathOf(e.b);
-    let i = 0;
-    while (i < pa.length && i < pb.length && pa[i] === pb[i]) i++;
-    const folder = (id) => (['dir', 'repo'].includes(state.T.N[id].kind) ? lay.rect.get(id) : null);
-    const outA = pa.slice(i, -1).reverse().map(folder).filter(Boolean), inB = pb.slice(i, -1).map(folder).filter(Boolean);
-    return bundleRoute(A, B, outA.slice(-4), inB.slice(0, 4));
+    return boxRoute(A, B);
   }
   const a = anchorOf(e.a), b = anchorOf(e.b);
   if (!a || !b) return null;
@@ -1297,19 +1301,19 @@ function routeOf2d(e, lay) {
   return arcRoute(a, ra.w / 2, b, rb.w / 2);
 }
 
-// The color, width, and strength a drawn link gets. Heavier links are drawn
-// thicker and stronger; widths come in half pixels so links share meshes.
+// The color, width, and strength a drawn link gets. Focus colors by the set's
+// boundary (dir), All by kind; both share one weight scale, so heavier links
+// are thicker and stronger. Widths come in half pixels so links share meshes.
 const halfPx = (w) => Math.round(w * 2) / 2;
 function linkStyle(e, maxW) {
   const th = theme();
   const share = Math.sqrt(e.w / maxW);
-  const strength = e.dir === 'dim' ? 0.3 + 0.25 * share : e.dir ? 0.75 + 0.25 * share : 0.5 + 0.5 * share;
-  const only = e.kind === 'change' && e.kinds.size === 1;
-  if (e.dir === 'dim') return { color: rgb(th.ink3), width: 1.5, strength };
+  if (e.dir === 'dim') return { color: rgb(th.ink3), width: 1.5, strength: 0.3 + 0.25 * share };
   if (e.dir === 'pick') return { color: rgb(th.accent), width: 4, strength: 1 };
-  if (e.dir) return { color: rgb(th.series[LINK_COLOR[e.dir]]), width: only ? 1.5 : halfPx(2.5 + 1.5 * share), strength: only ? strength * 0.5 : strength };
-  if (e.kind === 'change') return { color: rgb(th.ink2), width: LINK_WIDTH.change, strength: strength * 0.5 };
-  return { color: rgb(th.series[LINK_COLOR[e.kind] ?? 0]), width: halfPx((LINK_WIDTH[e.kind] ?? 2) * (0.8 + 0.4 * share)), strength };
+  const strength = 0.75 + 0.25 * share;
+  const only = e.kind === 'change' && e.kinds.size === 1;
+  const color = e.dir ? th.series[LINK_COLOR[e.dir]] : only ? th.ink2 : th.series[LINK_COLOR[e.kind] ?? 0];
+  return { color: rgb(color), width: only ? 1.5 : halfPx(2.5 + 1.5 * share), strength: only ? strength * 0.5 : strength };
 }
 
 // Lines are opaque, with colors mixed toward the background instead of alpha,
@@ -1343,9 +1347,8 @@ function lineMesh(layer, width, segs, order, fill) {
 // target's edge in the flat layouts, 92% along in City), and build its GPU
 // lines: one mesh per line width, colors fading in toward the target. Bright
 // layers (`cased`) get a background-colored outline under their lines, so they
-// stand clear of tiles, code, and the links below. `quiet` links (All, while
-// code is read) are drawn fainter.
-function drawLayer(layer, list, maxW, { cased = false, quiet = false } = {}) {
+// stand clear of tiles, code, and the links below.
+function drawLayer(layer, list, maxW, { cased = false } = {}) {
   const bg = rgb(theme().bg);
   const kind = state.lay?.kind;
   const atEdge = kind !== 'city';
@@ -1355,7 +1358,6 @@ function drawLayer(layer, list, maxW, { cased = false, quiet = false } = {}) {
     e.pts = p;
     if (!p || p.length < 6) continue;
     const st = linkStyle(e, maxW);
-    if (quiet) st.strength *= 0.45;
     e.color = st.color;
     e.width = st.width;
     e.fill = null;
@@ -1427,12 +1429,11 @@ function buildLinks({ force = false } = {}) {
   if (!L) return;
   const lay = state.lay;
   const live = !!lay && !!state.T && !lay.pending;
-  const quiet = live && state.links === 'all' && readingCode();
   const reads = live ? readCount() : '';
   const base = live ? `${lay.uid}|${state.T.uid}|${detailRank()}|${state.links}|${JSON.stringify(state.kinds)}|${theme().bg}` : '';
   const pickSig = live ? state.set.links.slice(0, 50).map((l) => { const a = idOf(l[0]); const f = a >= 0 ? state.T.fileOf[a] : -1; return f >= 0 && readable(f) ? 1 : 0; }).join('') : '';
   const sigs = {
-    base: live ? `${base}|${quiet}|${detailRank() > 3 ? reads : ''}` : '',
+    base: live ? `${base}|${detailRank() > 3 ? reads : ''}` : '',
     set: live ? `${base}|${state.setVer}|${pickSig}|${reads}|${state.set.links.length ? state.sitesVer ?? 0 : ''}` : '',
     hover: live && state.links === 'focus' ? `${base}|${state.setVer}|${state.hover}|${reads}|${state.hoverSite ? `${state.hoverSite.file}:${state.hoverSite.line}|${state.sitesVer ?? 0}` : ''}` : '',
   };
@@ -1457,7 +1458,8 @@ function buildLinks({ force = false } = {}) {
       const list = !live ? [] : name === 'base' ? baseLinks() : name === 'set' ? setLinks() : hoverLinks();
       const w = d3.max(list, (e) => e.w) ?? 1;
       layer.maxW = name === 'base' ? w : Math.max(maxW, w);
-      drawLayer(layer, list, layer.maxW, { cased: name !== 'base', quiet: name === 'base' && quiet });
+      // The faint backdrop (Focus) is the only uncased layer.
+      drawLayer(layer, list, layer.maxW, { cased: name !== 'base' || state.links === 'all' });
     }
     if (name !== 'base') maxW = Math.max(maxW, layer.maxW);
     layer.sig = sigs[name];
@@ -1574,17 +1576,6 @@ function drawFrame(now) {
     if (state.flash.size) busy = true;
   }
   if (busy) requestDraw();
-}
-
-// True when the selected code is zoomed in far enough to read as text.
-function readingCode() {
-  const lay = state.lay;
-  const f = state.T?.fileOf[selIds()[0] ?? -1] ?? -1;
-  if (f < 0) return false;
-  if (lay?.kind === 'city') return city.readable(f);
-  if (lay?.kind !== 'map') return false;
-  const c = lay.code.get(f);
-  return !!c && c.lh * state.t.k >= 7.5;
 }
 
 // Layout units → screen pixels is affine under the orthographic camera:
@@ -1981,7 +1972,7 @@ function inkCode(ctx, id, c, text, lhPx, quiet = false, view = state.t, opts = {
       const px = it.x * k + tx, py = it.y * k + ty;
       if (px > R.W || py > R.H || px + it.w * k < 0 || py + ph < 0) continue;
       ctx.font = `600 11px ${UI_FONT}`;
-      const label = fitText(ctx, `${s.form === 'ctor' ? 'new' : s.form ?? s.kind} ${s.name}`, it.w * k - 12);
+      const label = fitText(ctx, `${S.glyphOf(s)} ${s.name}`, it.w * k - 12);
       if (!label) continue;
       const w = textWidth(ctx, label);
       const box = [px + 3, py + 2, w + 10, 16];
@@ -2151,7 +2142,6 @@ function inkLinks(ctx) {
   const A = affine();
   const city3d = state.lay.kind === 'city';
   const k = state.t.k;
-  const quiet = state.links === 'all' && readingCode();
   let drawn = 0;
   for (const e of state.arrows ?? []) {
     if (drawn >= 600) break;
@@ -2166,7 +2156,7 @@ function inkLinks(ctx) {
     dx /= d; dy /= d;
     const size = 4 + (e.width ?? 2) * 1.8;
     if (e.tip) { x -= dx * size * 0.6; y -= dy * size * 0.6; }
-    ctx.fillStyle = (e.fill ??= [css(e.color, 1), css(e.color, 0.45)])[quiet && !e.dir ? 1 : 0];
+    ctx.fillStyle = (e.fill ??= css(e.color, 1));
     ctx.beginPath();
     ctx.moveTo(x + dx * size * 0.6, y + dy * size * 0.6);
     ctx.lineTo(x - dx * size * 0.6 - dy * size * 0.45, y - dy * size * 0.6 + dx * size * 0.45);
@@ -2886,37 +2876,48 @@ function hideTip() { const tip = $('#tip'); tip.hidden = true; tip.dataset.key =
 
 // ───────────────────────────── Bar ─────────────────────────────
 
+// The ✕ in a dialog's top-right corner: its last child, so it never takes
+// the dialog's first focus.
+const boxX = (box) => h('button', { class: 'icon-btn box-x', title: 'Close', 'aria-label': 'Close', onclick: () => box.close() }, icon('close'));
+
+// Options with an `icon` show it before the name.
 function seg(options, value, pick, { label, cls = '', title } = {}) {
   return h('div', { class: `seg ${cls}`, role: 'group', 'aria-label': title ?? label },
     label ? h('span', { class: 'label' }, label) : null,
-    options.map((o) => h('button', { 'aria-pressed': String(o.id === value), disabled: o.disabled, title: o.about ? `${o.about}${o.key ? ` (${o.key})` : ''}` : o.name, onclick: () => pick(o.id) }, o.name)));
+    options.map((o) => {
+      const tip = o.about ? `${o.about}${o.key ? ` (${o.key})` : ''}` : o.name;
+      return h('button', { 'aria-pressed': String(o.id === value), disabled: o.disabled, title: tip, onclick: () => pick(o.id) },
+        o.icon ? icon(o.icon) : null, o.name);
+    }));
 }
 
-function picker(options, value, pick, { label, cls = '' } = {}) {
-  return h('label', { class: `seg ${cls}`, title: label },
-    h('span', { class: 'label' }, label),
-    h('select', { onchange: (e) => pick(e.target.value), 'aria-label': label }, options.map((o) => h('option', { value: o.id, selected: o.id === value }, o.name))));
-}
-
+// Layout, Detail, Color, and Links live in the View panel and Open in the
+// brand, so the bar holds only the panel toggles and the app's buttons.
+// Groups: View with Fit all, the other panels, then settings and help.
 function drawBar() {
-  document.body.classList.toggle('city', state.layout === 'city');
   const tools = $('#tools');
-  // Three groups: the layout, how the view is drawn, and the app's buttons.
+  const dockBtn = (p) => h('button', { class: 'icon-btn', title: `${p.name}: ${p.about}`, 'aria-label': p.name, 'aria-pressed': String(state.dock === p.id), onclick: () => hub.emit('dock.show', state.dock === p.id ? null : p.id) }, icon(p.id));
+  const infoBtn = h('button', { class: 'icon-btn', title: 'Selection: the set, its links and findings, and saved sets', 'aria-label': 'Selection', 'aria-pressed': String(infoShown()), onclick: infoFlip }, icon('info'));
   tools.replaceChildren(
-    seg(LAYOUTS, state.layout, (id) => hub.emit('view.layout', id), { cls: 'wide', title: 'Layout' }),
-    h('div', { class: 'group wide opt', role: 'group', 'aria-label': 'View' },
-      picker(DETAILS, state.detail, (id) => hub.emit('view.detail', id), { label: 'Detail' }),
-      picker(PAINTS, state.paint, (id) => hub.emit('view.paint', id), { label: 'Color' }),
-      state.layout === 'city' ? picker(HEIGHTS, state.height, (id) => hub.emit('view.height', id), { label: 'Height' }) : null,
-      seg(LINK_MODES, state.links, (id) => hub.emit('view.links', id), { label: 'Links' })),
+    h('div', { class: 'group icons wide', role: 'group', 'aria-label': 'View and fit' },
+      dockBtn(PANELS.find((p) => p.id === 'view')),
+      h('button', { class: 'icon-btn', title: 'Fit all (F)', 'aria-label': 'Fit all', onclick: () => fitAll() }, icon('fit'))),
+    h('div', { class: 'group icons wide', role: 'group', 'aria-label': 'Panels' },
+      PANELS.filter((p) => p.id !== 'view').flatMap((p) => (p.id === 'change' ? [infoBtn, dockBtn(p)] : [dockBtn(p)]))),
     h('div', { class: 'group icons' },
-      h('button', { class: 'icon-btn view-btn', title: 'View options', 'aria-label': 'View options', 'aria-pressed': String(state.dock === 'view'), onclick: () => hub.emit('dock.show', state.dock === 'view' ? 'check' : 'view') }, icon('view')),
-      h('button', { class: 'icon-btn wide', title: 'Fit all (F)', 'aria-label': 'Fit all', onclick: () => fitAll() }, icon('fit')),
       h('button', { class: 'icon-btn', title: 'Settings', 'aria-label': 'Settings', onclick: () => hub.emit('box.open', 'setup') }, icon('setup')),
       h('button', { class: 'icon-btn wide', title: 'Keys and help (?)', 'aria-label': 'Help', onclick: () => hub.emit('box.open', 'keys') }, icon('help'))));
   const tabs = $('#tabs');
   const tab = (id, name, ic) => h('button', { 'aria-pressed': String(state.sheet === id), onclick: () => hub.emit('sheet.toggle', id) }, icon(ic), name);
   tabs.replaceChildren(tab('view', 'View', 'view'), tab('check', 'Check', 'check'), tab('change', 'Change', 'change'), tab('info', 'Selection', 'info'));
+  sizeBar();
+}
+
+// Both sides of the bar take the wider side's width (the brand or the tools;
+// the breadcrumb shrinks), so Find stays centered on the window.
+function sizeBar() {
+  const side = Math.max($('#brand').offsetWidth, $('#tools').offsetWidth);
+  $('#bar').style.setProperty('--side', `${side}px`);
 }
 
 function drawCrumbs() {
@@ -3119,11 +3120,11 @@ function drawDock() {
   if (!open) { dock.replaceChildren(); return; }
   const which = state.narrow ? state.sheet : state.dock;
   if (which === 'view') {
-    dock.replaceChildren(...(state.narrow ? [] : [h('div', { class: 'panel-head' }, h('b', null, 'View'), h('span', { class: 'spacer' }), h('button', { class: 'btn ghost small', 'aria-label': 'Close panel', onclick: () => hub.emit('dock.show', 'check') }, icon('close')))]), viewSheet());
+    dock.replaceChildren(...(state.narrow ? [] : [h('div', { class: 'panel-head' }, h('b', null, 'View'), h('span', { class: 'spacer' }), h('button', { class: 'btn ghost small', title: 'Close panel', 'aria-label': 'Close panel', onclick: () => hub.emit('dock.show', null) }, icon('close')))]), viewSheet());
     return;
   }
   const head = h('div', { class: 'panel-head' },
-    seg([{ id: 'check', name: 'Check' }, { id: 'change', name: 'Change' }], which, (id) => hub.emit('dock.show', id)),
+    h('b', null, PANELS.find((p) => p.id === which).name),
     h('span', { class: 'spacer' }),
     which === 'check' ? h('button', { class: 'btn ghost small', title: 'Show issues marked as fine', 'aria-pressed': String(state.showWaived), onclick: () => hub.emit('check.waived', !state.showWaived) }, state.showWaived ? 'Hide waived' : 'Show waived') : null,
     which === 'change' && state.agent.log.length ? h('button', { class: 'btn ghost small', title: 'Start a new conversation', onclick: () => hub.emit('agent.reset') }, 'New chat') : null,
@@ -3157,7 +3158,8 @@ function viewSheet() {
     cityOn ? h('div', { class: 'section' }, h('h3', null, 'Angle'), seg(ANGLES, state.angle, (id) => hub.emit('view.angle', id))) : null,
     h('div', { class: 'section' }, h('h3', null, 'Detail'), seg(DETAILS, state.detail, (id) => hub.emit('view.detail', id))),
     h('div', { class: 'section' }, h('h3', null, 'Links'), seg(LINK_MODES, state.links, (id) => hub.emit('view.links', id))),
-    h('div', { class: 'row' }, h('button', { class: 'btn', onclick: () => fitAll() }, icon('fit'), 'Fit all'), h('button', { class: 'btn', onclick: () => hub.emit('box.open', 'open') }, icon('open'), 'Open folder'), h('button', { class: 'btn', onclick: () => hub.emit('box.open', 'keys') }, icon('help'), 'Help')));
+    // On phones the bar hides open, fit, and help; elsewhere they are only in the bar.
+    h('div', { class: 'row tool-row' }, h('button', { class: 'btn', onclick: () => hub.emit('box.open', 'open') }, icon('open'), 'Open folder'), h('button', { class: 'btn', onclick: () => fitAll() }, icon('fit'), 'Fit all'), h('button', { class: 'btn', onclick: () => hub.emit('box.open', 'keys') }, icon('help'), 'Help')));
 }
 
 function coverage() {
@@ -3382,17 +3384,26 @@ function renderText(el, text) {
 // not empty: one part shows its details, several show members, interface,
 // findings, and growth; one link shows its ends and the lines where it happens.
 
+// On wide screens the bar's Selection toggle decides (state.info); phones use
+// the bottom sheet.
+const infoShown = () => (state.narrow ? state.sheet === 'info' : state.info === 'open' || (state.info === 'auto' && !setEmpty()));
+// The toggle: off stays off through new selections; on with an empty set
+// keeps the panel open (its Sets button loads saved sets).
+const infoFlip = () => hub.emit('info.show', infoShown() ? 'shut' : setEmpty() ? 'open' : 'auto');
+
 function showSelection() {
   if (state.narrow) { hub.emit('sheet.toggle', state.sheet === 'info' ? null : 'info'); return; }
-  $('#info').hidden = false;
-  drawSelection();
+  hub.emit('info.show', setEmpty() ? 'open' : 'auto');
 }
 
 function drawSelection() {
   const info = $('#info');
   const s = state.set;
-  const show = state.narrow ? state.sheet === 'info' : !setEmpty();
+  const show = infoShown();
+  // The bar's toggle follows the panel when the set opens or closes it.
+  const flip = info.hidden === show;
   info.hidden = !show;
+  if (flip && !state.narrow) drawBar();
   state.panelFiles = new Set();
   if (!show) return;
   const body = h('div', { class: 'panel-body' });
@@ -3421,7 +3432,10 @@ function selHead() {
     live ? h('div', { class: 'live', title: 'A live set follows its recipe as the code changes' }, h('span', null, `Live · ${live}`), h('button', { class: 'btn tiny ghost', title: 'Stop following the recipe; keep these members as they are', onclick: () => hub.emit('set.freeze') }, 'Freeze')) : null,
     h('button', { class: 'btn ghost small', title: 'Save this set, or load a saved one', 'aria-label': 'Sets', onclick: (e) => askSets(e.currentTarget) }, icon('save'), 'Sets', state.saved.length ? h('span', { class: 'count' }, fmt(state.saved.length)) : null),
     setEmpty() ? null : h('button', { class: 'btn ghost small', title: 'Isolate: dim everything else (I)', 'aria-label': 'Isolate', 'aria-pressed': String(state.isolate), onclick: () => hub.emit('set.isolate', !state.isolate) }, icon('isolate')),
-    h('button', { class: 'btn ghost small', 'aria-label': 'Clear the selection', title: 'Clear (Esc)', onclick: () => hub.emit('pick.clear') }, icon('close')));
+    // Empty (opened from the bar), ✕ closes it until the next selection.
+    setEmpty() && !state.narrow
+      ? h('button', { class: 'btn ghost small', 'aria-label': 'Close panel', title: 'Close panel', onclick: () => hub.emit('info.show', 'auto') }, icon('close'))
+      : h('button', { class: 'btn ghost small', 'aria-label': 'Clear the selection', title: 'Clear (Esc)', onclick: () => hub.emit('pick.clear') }, icon('close')));
 }
 
 function drawOne(body, id) {
@@ -3462,7 +3476,7 @@ function drawOne(body, id) {
   }
   const { uses, users } = refsOf(id);
   // Same-named parts (a struct and its impl) get their kind as a label.
-  const twin = (list) => { const seen = d3.rollup(list, (v) => v.length, ([x]) => nameOf(x)); return (x) => seen.get(nameOf(x)) > 1 ? formOf(x) : undefined; };
+  const twin = (list) => { const seen = d3.rollup(list, (v) => v.length, ([x]) => nameOf(x)); return (x) => seen.get(nameOf(x)) > 1 ? glyphTag(x) : undefined; };
   const tu = twin(uses.slice(0, 14)), tb = twin(users.slice(0, 14));
   if (uses.length) body.append(h('div', { class: 'section' }, h('h3', null, 'Uses', h('span', { class: 'count' }, fmt(uses.length))), h('div', { class: 'refs' }, uses.slice(0, 14).map(([x, w, kinds]) => refRow(x, w, kinds, 'out', tu(x))))));
   if (users.length) body.append(h('div', { class: 'section' }, h('h3', null, 'Used by', h('span', { class: 'count' }, fmt(users.length))), h('div', { class: 'refs' }, users.slice(0, 14).map(([x, w, kinds]) => refRow(x, w, kinds, 'in', tb(x))))));
@@ -3472,7 +3486,7 @@ function drawOne(body, id) {
     walk(id, (k) => { if (k !== id && rows.length < 120) rows.push(k); });
     rows.sort((a, b) => T.N[a].from - T.N[b].from);
     body.append(h('div', { class: 'section' }, h('h3', null, 'Outline'), h('div', { class: 'refs outline' }, rows.map((k) => h('button', { class: 'ref', style: { '--d': T.symDepth[k] }, onclick: () => { hub.emit('pick.set', { ids: [k] }); flyTo(k); } },
-      h('span', { class: 'k' }, formOf(k)), h('span', { class: 'name' }, T.N[k].name), h('span', { class: 'n' }, T.N[k].from))))));
+      glyphTag(k), h('span', { class: 'name' }, T.N[k].name), h('span', { class: 'n' }, T.N[k].from))))));
   }
   if (n.kind === 'dir' || n.kind === 'repo') {
     const files = [];
@@ -3632,9 +3646,21 @@ function countFiles(id) {
 }
 
 // A part's short kind label: func, class, struct, new, file …
-function formOf(id) {
+// Forms whose keyword is not the plain word for them.
+const FORM_WORDS = { ctor: 'constructor', type: 'type alias' };
+
+// Each glyph with the forms it stands for, in table order, then headings.
+function glyphLegend() {
+  const by = new Map();
+  for (const [form, g] of Object.entries(S.GLYPHS)) by.set(g, [...(by.get(g) ?? []), FORM_WORDS[form] ?? form]);
+  return [...by, ['#', ['heading']]];
+}
+
+// A part's glyph in a list, with its form spelled out in the tooltip.
+function glyphTag(id) {
   const n = state.T.N[id];
-  return n.form === 'ctor' ? 'new' : n.form === 'function' ? 'func' : n.form ?? n.kind;
+  const word = /^h\d$/.test(n.form ?? '') ? `heading ${n.form[1]}` : FORM_WORDS[n.form] ?? n.form ?? KIND_NAME[n.kind];
+  return h('span', { class: 'g', title: word }, S.glyphOf(n));
 }
 
 function refRow(id, w, kinds, dir, label) {
@@ -3644,7 +3670,7 @@ function refRow(id, w, kinds, dir, label) {
   return h('div', { class: 'member' },
     h('button', { class: 'ref', title: where(id), onclick: () => { hub.emit('pick.set', { ids: [id] }); flyTo(id); }, onmouseenter: () => hub.emit('pick.hover', { id }) },
       h('span', { class: 'sw', style: { background: dir ? th.series[dir === 'out' ? 0 : 1] : css(paintOf(id)) } }),
-      label ? h('span', { class: 'k' }, label) : null,
+      typeof label === 'string' ? h('span', { class: 'k' }, label) : label ?? null,
       h('span', { class: 'name' }, nameOf(id)),
       kinds ? h('span', { class: 'n' }, [...kinds].map((k) => LINK_NAMES[k]).join(', ')) : null,
       h('span', { class: 'n' }, w ? `×${w}` : short(n.lines))),
@@ -3790,9 +3816,9 @@ function drawAct() {
   const el = $('#act');
   if (setEmpty() || !state.T) { el.hidden = true; return; }
   el.hidden = false;
-  const v = viewport();
-  el.style.left = state.narrow ? '' : `${v.x + v.w / 2}px`;
-  el.style.maxWidth = state.narrow ? '' : `${Math.max(240, v.w - 24)}px`;
+  // Centered on the window, and no wider than the free space on either side of the middle.
+  const v = viewport(), mid = window.innerWidth / 2;
+  el.style.maxWidth = state.narrow ? '' : `${Math.max(240, 2 * Math.min(mid - v.x, v.x + v.w - mid) - 24)}px`;
   const each = state.mode === 'each';
   const acts = barActions().map((a) => h('button', { class: `btn small act-btn${a.agent ? ' agent' : ''}`, 'data-act': a.id, title: `${a.agent ? 'Agent: ' : ''}${a.about ?? a.name}${a.key ? ` (${a.key})` : ''}`, onclick: () => runAct(a.id) }, a.name));
   const list = h('div', { class: 'act-list' }, acts);
@@ -3850,6 +3876,7 @@ function openChange() {
   savePrefs();
   drawBar();
   drawDock();
+  drawAct();
 }
 
 function openAsk() {
@@ -4173,7 +4200,8 @@ async function drawOpenBox(dir) {
     h('div', { class: 'box-foot' },
       welcome ? h('button', { class: 'btn ghost', style: { marginRight: 'auto' }, onclick: () => { box.close(); wire.ask('repo.demo'); } }, 'Try the demo') : null,
       h('button', { class: 'btn ghost', onclick: () => box.close() }, welcome ? 'Later' : 'Cancel'),
-      h('button', { class: 'btn primary', onclick: () => open(input.value.trim()) }, data.repo ? 'Open this repo' : 'Open this folder')));
+      h('button', { class: 'btn primary', onclick: () => open(input.value.trim()) }, data.repo ? 'Open this repo' : 'Open this folder')),
+    boxX(box));
   if (!box.open) box.showModal();
 }
 
@@ -4185,6 +4213,7 @@ function drawSetupBox() {
   const model = h('input', { type: 'text', value: c.model ?? '', placeholder: 'deepseek/deepseek-v4.1-flash', spellcheck: false });
   const key = h('input', { type: 'password', value: '', placeholder: c.hasKey ? 'Saved. Type to replace.' : 'sk-…', autocomplete: 'off' });
   const turns = h('input', { type: 'number', value: c.maxTurns ?? 40, min: 1, max: 200 });
+  const size = h('input', { type: 'number', value: c.maxKB ?? 2000, min: 1, max: 100000 });
   const style = h('textarea', { rows: 5, placeholder: 'How you like code shaped. Example: Small files. One class per file. Guard clauses over nesting. No abbreviations.' });
   style.value = c.style ?? '';
   const result = h('div', { class: 'note' });
@@ -4199,7 +4228,7 @@ function drawSetupBox() {
   const parserHint = c.trees?.ready
     ? `Tree-sitter reads exact syntax trees for ${c.trees.langs.join(', ')}; other languages keep the built-in parser. Changing it rescans every repo.`
     : 'Tree-sitter needs the optional @vscode/tree-sitter-wasm package: run npm install.';
-  const patch = () => ({ endpoint: endpoint.value.trim(), model: model.value.trim(), style: style.value, maxTurns: +turns.value || 40, parser, ...(key.value ? { apiKey: key.value.trim() } : {}) });
+  const patch = () => ({ endpoint: endpoint.value.trim(), model: model.value.trim(), style: style.value, maxTurns: +turns.value || 40, parser, maxKB: +size.value || 2000, ...(key.value ? { apiKey: key.value.trim() } : {}) });
   box.replaceChildren(
     h('div', { class: 'box-head' }, h('h2', null, 'Settings'), h('p', null, 'The agent talks to any OpenAI-compatible endpoint.')),
     h('div', { class: 'box-body' },
@@ -4210,11 +4239,13 @@ function drawSetupBox() {
       f('Style guide', style, 'Sent with every request. The agent follows it when it edits.'),
       h('div', { class: 'field' }, h('label', null, 'Theme'), themeSeg),
       h('div', { class: 'field' }, h('label', null, 'Parser'), parserSeg, h('div', { class: 'hint' }, parserHint)),
+      f('Max file size', size, 'In KB. Larger files are listed, not read. Changing it rescans every repo.'),
       result),
     h('div', { class: 'box-foot' },
       h('button', { class: 'btn ghost', style: { marginRight: 'auto' }, onclick: async () => { await wire.ask('config.set', patch()); result.textContent = 'Testing…'; const r = await wire.ask('agent.test'); result.textContent = r.ok ? `Connected. Model replied: ${r.text}` : `Failed: ${r.text}`; result.style.color = r.ok ? STATUS.good : STATUS.critical; } }, 'Test'),
       h('button', { class: 'btn ghost', onclick: () => box.close() }, 'Cancel'),
-      h('button', { class: 'btn primary', onclick: async () => { await wire.ask('config.set', patch()); box.close(); toast('Settings saved.'); } }, 'Save')));
+      h('button', { class: 'btn primary', onclick: async () => { await wire.ask('config.set', patch()); box.close(); toast('Settings saved.'); } }, 'Save')),
+    boxX(box));
   if (!box.open) box.showModal();
 }
 
@@ -4264,8 +4295,10 @@ function drawKeysBox() {
           h('kbd', null, 'Drag grip'), h('span', null, 'Move a selected file or folder into a folder, or a type or function into a file'),
           h('kbd', null, 'Legend'), h('span', null, 'Click a color to select every part with it; drag across a gradient for a range. Click a link kind to show or hide it.'),
           h('kbd', null, 'Right-drag, Alt+drag'), h('span', null, 'City: orbit. Two-finger twist turns on touch.'))),
-      h('div', { class: 'section' }, h('h3', null, 'Layouts'), LAYOUTS.map((l) => h('div', { class: 'note' }, h('b', null, l.name), ' — ', l.about)))),
-    h('div', { class: 'box-foot' }, h('button', { class: 'btn primary', onclick: () => box.close() }, 'Done')));
+      h('div', { class: 'section' }, h('h3', null, 'Layouts'), LAYOUTS.map((l) => h('div', { class: 'note' }, icon(l.icon), h('b', null, l.name), ' — ', l.about))),
+      h('div', { class: 'section' }, h('h3', null, 'Symbols'), glyphLegend().map(([g, forms]) => h('div', { class: 'note' }, h('b', { class: 'glyph' }, g), forms.join(', '))))),
+    h('div', { class: 'box-foot' }, h('button', { class: 'btn primary', onclick: () => box.close() }, 'Done')),
+    boxX(box));
   if (!box.open) box.showModal();
 }
 
@@ -4347,21 +4380,21 @@ function rampBrush(paint) {
   return wrap;
 }
 
-// Fade the legend's right edge while more keys are scrolled out of view.
+// Fade each legend's right edge while more keys are scrolled out of view.
 function legendFade() {
-  const l = $('#legend');
-  l.classList.toggle('more', l.scrollLeft + l.clientWidth < l.scrollWidth - 2);
+  for (const l of document.querySelectorAll('#foot .legend')) l.classList.toggle('more', l.scrollLeft + l.clientWidth < l.scrollWidth - 2);
 }
 
 function drawFoot() {
   drawLegend();
+  drawLinkKeys();
   drawStatus();
 }
 
-// The legend only rebuilds when what it shows changes.
+// The color legend only rebuilds when what it shows changes.
 function drawLegend() {
   const legend = $('#legend');
-  const sig = [state.T?.uid, state.paint, THEME.bg, state.links, !!state.linkList?.length, setEmpty(), selIds().length > 1, JSON.stringify(state.kinds), detailRank()].join('|');
+  const sig = [state.T?.uid, state.paint, THEME.bg, setEmpty(), detailRank()].join('|');
   if (legend.sig === sig) return;
   legend.sig = sig;
   const th = theme();
@@ -4397,22 +4430,40 @@ function drawLegend() {
         keys.push(key(th.ink, 'Selection', null), h('span', { class: 'muted' }, 'Uses'), step('out', 1), step('out', 2), step('out', 3), h('span', { class: 'muted' }, 'Used by'), step('in', 1), step('in', 2), step('in', 3), key(th.series[6], 'Both', { key: 'reach:both' }));
       }
     }
-    if (state.links !== 'none' && (state.linkList?.length || !setEmpty())) {
-      keys.push(h('span', { class: 'title', style: { marginLeft: '8px' } }, 'Links'));
-      if (state.links === 'focus') {
-        keys.push(h('span', { class: 'key', title: 'Links from the selection' }, h('i', { class: 'sw', style: { background: th.series[0] } }), 'outgoing'), h('span', { class: 'key', title: 'Links into the selection' }, h('i', { class: 'sw', style: { background: th.series[1] } }), 'incoming'));
-        if (selIds().length > 1) keys.push(h('span', { class: 'key' }, h('i', { class: 'sw', style: { background: th.series[6] } }), 'inside'));
-      }
-      for (const kind of KIND_ORDER) {
-        if (!state.model.linkKinds.includes(kind)) continue;
-        const on = kindOn(kind);
-        const color = state.links === 'all' ? (kind === 'change' ? th.ink2 : th.series[LINK_COLOR[kind]]) : th.ink3;
-        keys.push(h('button', { class: `key kind${on ? '' : ' off'}`, 'aria-pressed': String(on), title: `${on ? 'Hide' : 'Show'} ${LINK_NAMES[kind]} links`, onclick: () => hub.emit('view.kinds', { kind, on: !on }) },
-          h('i', { class: 'sw line', style: { background: color } }), LINK_NAMES[kind]));
-      }
-    }
   }
   legend.replaceChildren(...keys);
+  fadeSoon();
+}
+
+// Link directions and the kind toggles, in their own pill beside the color
+// legend; empty (hidden) while links are off or none are drawn.
+function drawLinkKeys() {
+  const el = $('#links');
+  const sig = [state.T?.uid, THEME.bg, state.links, !!state.linkList?.length, setEmpty(), selIds().length > 1, JSON.stringify(state.kinds)].join('|');
+  if (el.sig === sig) return;
+  el.sig = sig;
+  const th = theme();
+  const keys = [];
+  if (state.model && state.links !== 'none' && (state.linkList?.length || !setEmpty())) {
+    keys.push(h('span', { class: 'title' }, 'Links'));
+    if (state.links === 'focus') {
+      keys.push(h('span', { class: 'key', title: 'Links from the selection' }, h('i', { class: 'sw', style: { background: th.series[0] } }), 'outgoing'), h('span', { class: 'key', title: 'Links into the selection' }, h('i', { class: 'sw', style: { background: th.series[1] } }), 'incoming'));
+      if (selIds().length > 1) keys.push(h('span', { class: 'key' }, h('i', { class: 'sw', style: { background: th.series[6] } }), 'inside'));
+    }
+    for (const kind of KIND_ORDER) {
+      if (!state.model.linkKinds.includes(kind)) continue;
+      const on = kindOn(kind);
+      const color = state.links === 'all' ? (kind === 'change' ? th.ink2 : th.series[LINK_COLOR[kind]]) : th.ink3;
+      keys.push(h('button', { class: `key kind${on ? '' : ' off'}`, 'aria-pressed': String(on), title: `${on ? 'Hide' : 'Show'} ${LINK_NAMES[kind]} links`, onclick: () => hub.emit('view.kinds', { kind, on: !on }) },
+        h('i', { class: 'sw line', style: { background: color } }), LINK_NAMES[kind]));
+    }
+  }
+  el.replaceChildren(...keys);
+  fadeSoon();
+}
+
+// One fade check per frame, after the legends have laid out.
+function fadeSoon() {
   if (!legendFade.soon) legendFade.soon = requestAnimationFrame(() => { legendFade.soon = 0; legendFade(); });
 }
 
@@ -4454,7 +4505,7 @@ function applyTheme() {
 // ───────────────────────────── Messages ─────────────────────────────
 
 function savePrefs() {
-  for (const k of ['layout', 'paint', 'links', 'detail', 'theme', 'dock', 'kinds', 'height', 'mode']) store.save(k, state[k]);
+  for (const k of ['layout', 'paint', 'links', 'detail', 'theme', 'dock', 'info', 'kinds', 'height', 'mode']) store.save(k, state[k]);
 }
 
 function refresh() {
@@ -4841,6 +4892,15 @@ hub.on('dock.show', (id) => {
   drawDock();
   drawAct();
 });
+// Set the Selection toggle's mode (see state.info).
+hub.on('info.show', (mode) => {
+  state.info = mode;
+  savePrefs();
+  drawSelection();
+  drawBar();
+  drawAct();
+  requestDraw();
+});
 hub.on('sheet.toggle', (id) => {
   state.sheet = state.sheet === id ? null : id;
   document.body.classList.toggle('sheet-open', !!state.sheet);
@@ -4929,6 +4989,7 @@ function setupKeys() {
 function resize() {
   state.narrow = matchMedia('(max-width: 760px)').matches;
   document.body.classList.toggle('narrow', state.narrow);
+  sizeBar();
   sizeGL();
   const map = state.mapLay;
   if (map) {
@@ -4972,16 +5033,24 @@ function boot() {
   setupKeys();
   resize();
   window.addEventListener('resize', () => { resize(); legendFade(); });
-  const legend = $('#legend');
-  legend.addEventListener('scroll', legendFade);
-  legend.addEventListener('wheel', (e) => {
-    if (Math.abs(e.deltaY) <= Math.abs(e.deltaX) || legend.scrollWidth <= legend.clientWidth) return;
-    legend.scrollLeft += e.deltaY;
-    e.preventDefault();
-  }, { passive: false });
+  for (const legend of document.querySelectorAll('#foot .legend')) {
+    legend.addEventListener('scroll', legendFade);
+    legend.addEventListener('wheel', (e) => {
+      if (Math.abs(e.deltaY) <= Math.abs(e.deltaX) || legend.scrollWidth <= legend.clientWidth) return;
+      legend.scrollLeft += e.deltaY;
+      e.preventDefault();
+    }, { passive: false });
+  }
   $('#brand').addEventListener('click', () => hub.emit('box.open', 'open'));
   document.addEventListener('pointerdown', (e) => { if (!$('#ask').hidden && !$('#ask').contains(e.target)) unpop(); }, true);
-  for (const box of document.querySelectorAll('dialog')) box.addEventListener('click', (e) => { if (e.target === box) box.close(); });
+  // A click on the backdrop closes a dialog only when the press started there
+  // too: selecting a field's text and letting go past the edge is not one.
+  for (const box of document.querySelectorAll('dialog')) {
+    const outside = (e) => { const r = box.getBoundingClientRect(); return e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom; };
+    let pressed = false;
+    box.addEventListener('pointerdown', (e) => { pressed = e.target === box && outside(e); });
+    box.addEventListener('click', (e) => { if (pressed && e.target === box && outside(e)) box.close(); pressed = false; });
+  }
   document.fonts?.ready.then(() => { measureMono(); widths.clear(); widthCount = 0; requestDraw(); });
   drawFoot();
   wire.open();

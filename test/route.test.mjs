@@ -4,7 +4,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { arcRoute, layerRoute, exitOf, boxRoute, gutterRoute, bundleRoute, codeRoute } from '../app/core_route.mjs';
+import { arcRoute, layerRoute, exitOf, boxRoute, gutterRoute, codeRoute } from '../app/core_route.mjs';
 
 const dist = (p, q) => Math.hypot(p[0] - q[0], p[1] - q[1]);
 const near = (a, b, eps = 1e-3) => Math.abs(a - b) <= eps;
@@ -151,17 +151,6 @@ describe('Map routes', () => {
     assert.ok(monotone(pts, (p) => p[1]));
   });
 
-  test('bundleRoute crosses folder borders, ends on the boxes, and is one curve both ways', () => {
-    const left = box(0, 0, 200, 200), right = box(400, 0, 200, 200);
-    const A = box(20, 80, 40, 40), B = box(500, 60, 40, 40);
-    const pts = bundleRoute(A, B, [left], [right]);
-    assert.ok(onBorder(pts[0], A) && onBorder(pts.at(-1), B));
-    assert.ok(samePts(bundleRoute(B, A, [right], [left]), reversed(pts)));
-    assert.ok(monotone(pts, (p) => p[0]));
-    const mids = pts.filter((p) => p[0] > 200 && p[0] < 400);
-    assert.ok(mids.length && mids.every((p) => p[1] > 40 && p[1] < 160), 'stays between the folders');
-  });
-
   test('codeRoute runs level from a code line to its file edge, then curves to the target', () => {
     const F = box(0, 0, 200, 100), line = box(10, 40, 80, 4, 'h'), B = box(400, 0, 60, 40);
     const pts = codeRoute(line, B, F, null);
@@ -170,10 +159,5 @@ describe('Map routes', () => {
     assert.ok(onBorder(pts.at(-1), B));
     assert.ok(pts.slice(1).every((p) => p[0] >= 200 - 1e-9), 'leaves the file before it bends');
     assert.ok(samePts(codeRoute(B, line, null, F), reversed(pts)));
-  });
-
-  test('bundleRoute with no folders between is a box route', () => {
-    const A = box(0, 0, 40, 40), B = box(100, 0, 40, 40);
-    assert.ok(samePts(bundleRoute(A, B, [], []), boxRoute(A, B)));
   });
 });

@@ -883,7 +883,8 @@ export function makeCity(env) {
     if (pts.length === 2) pts = [a, [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, Math.max(a[2], b[2]) + Math.hypot(b[0] - a[0], b[1] - a[1]) * 0.25], b];
     const n = pts.length - 1;
     pts = pts.map((p, k) => (k === 0 || k === n ? p : p.map((v, j) => 0.85 * v + 0.15 * (a[j] + (b[j] - a[j]) * (k / n)))));
-    return spline(pts, 24);
+    // Eight samples per span, so long skyways stay as smooth as short ones.
+    return spline(pts, Math.max(24, pts.length * 8));
   }
 
   // Uniform cubic B-spline through clamped ends.
@@ -962,7 +963,7 @@ export function makeCity(env) {
       if (!onScreen(p) || hidden(b.x + b.w * 0.05, b.y + b.h * 0.05, top) || C.faint?.(b.id)) continue;
       const n = T.N[b.id];
       ctx.font = `600 11px ${env.UI_FONT}`;
-      const text = env.fitText(ctx, `${n.form === 'ctor' ? 'new' : n.form ?? n.kind} ${n.name}`, Math.min(V.ul * b.w - 10, 200));
+      const text = env.fitText(ctx, `${env.S.glyphOf(n)} ${n.name}`, Math.min(V.ul * b.w - 10, 200));
       if (!text) continue;
       const w = env.textWidth(ctx, text);
       if (!clear(p[0] + 3, p[1] + 2, w + 10) || !free(p[0] + 3, p[1] + 2, w + 10, 16)) continue;

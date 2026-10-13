@@ -85,6 +85,14 @@ describe('masking', () => {
 });
 
 describe('symbols', () => {
+  test('a long comment after a name parses in linear time', () => {
+    // Masked to one blank run after `X`: a call pattern that splits it two ways is quadratic.
+    const src = `#define X\n/*${' doc\n'.repeat(10_000)}*/\nint main(void) { return 0; }\n`;
+    const t = performance.now();
+    const f = readFacts('big.h', src);
+    assert.ok(performance.now() - t < 500, `${Math.round(performance.now() - t)} ms`);
+    assert.ok(f.syms.some((s) => s.name === 'main'));
+  });
   test('C#: namespaces, types, constructors, methods, interface members, records', () => {
     const src = `namespace Shop.Orders;
 public interface IStore
@@ -746,6 +754,44 @@ describe('config', () => {
       assert.ok(!JSON.stringify(state).includes('secret-key'));
     } finally {
       if (old === undefined) delete process.env.DEVIBE_MODEL; else process.env.DEVIBE_MODEL = old;
+    }
+  });
+  test('the file size limit comes from env or file, is clamped, and rescans when it changes', async () => {
+    const home = tmp('cfg');
+    fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ maxKB: 500 }));
+    const old = process.env.DEVIBE_MAX_KB;
+    try {
+      delete process.env.DEVIBE_MAX_KB;
+      assert.equal(loadConfig(tmp('cfg')).maxKB, 2000, 'default');
+      assert.equal(loadConfig(home).maxKB, 500);
+      process.env.DEVIBE_MAX_KB = '300';
+      assert.equal(loadConfig(home).maxKB, 300, 'env wins');
+      process.env.DEVIBE_MAX_KB = 'lots';
+      assert.equal(loadConfig(home).maxKB, 500, 'a bad value falls back');
+      delete process.env.DEVIBE_MAX_KB;
+      const dir = tmp('size');
+      fs.writeFileSync(path.join(dir, 'small.js'), 'function a() { return 1; }\n');
+      fs.writeFileSync(path.join(dir, 'large.js'), 'function b() { return 2; }\n' + '// pad\n'.repeat(400));
+      const space = new Workspace({ home, watch: false });
+      await space.open(dir);
+      const fact = (rel) => space.repos[0].facts.get(rel);
+      assert.ok(fact('large.js').syms.length && !fact('large.js').big, 'under the limit: read');
+      assert.equal(space.setConfig({ maxKB: 2 }), true);
+      await space.scan();
+      assert.ok(fact('large.js').big && !fact('large.js').syms.length, 'over the limit: listed, not read');
+      assert.ok(fact('small.js').syms.length);
+      assert.equal(space.repos[0].stats.big, 1);
+      assert.equal(space.setConfig({ maxKB: 2 }), false, 'no change, no rescan');
+      assert.equal(space.configState().maxKB, 2);
+      assert.equal(loadConfig(home).maxKB, 2, 'saved');
+      assert.equal(space.setConfig({ maxKB: 10 }), true);
+      await space.scan();
+      assert.ok(fact('large.js').syms.length && !fact('large.js').big, 'a higher limit reads it again');
+      space.setConfig({ maxKB: -4 });
+      assert.equal(space.configState().maxKB, 1, 'clamped');
+      space.close();
+    } finally {
+      if (old === undefined) delete process.env.DEVIBE_MAX_KB; else process.env.DEVIBE_MAX_KB = old;
     }
   });
 });

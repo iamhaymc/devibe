@@ -143,7 +143,7 @@ code, .mono { font-family: var(--mono); font-size: 12px; }
 /* Small floating chrome is frosted glass. Large panels are opaque: blurring
    their area behind a map that redraws every frame costs more GPU time than
    the map itself. */
-.glass, #bar > *, #foot > *, .tip, .pop, .toast {
+.glass, .lead > *, .find, #foot > *, .tip, .pop, .toast {
   background: var(--glass);
   border: 1px solid var(--edge);
   border-radius: var(--radius);
@@ -160,19 +160,24 @@ code, .mono { font-family: var(--mono); font-size: 12px; }
 
 /* ── Bar ── */
 
+/* Three columns: the brand and breadcrumb, Find, the tools. The sides share
+   one width (--side, the wider side's content, set by sizeBar), so Find stays
+   centered on the window and gives way before either side does. */
 #bar {
   position: fixed;
   top: var(--gap);
   left: var(--gap);
   right: var(--gap);
   height: var(--bar-h);
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(var(--side, 0px), 1fr) minmax(120px, 560px) minmax(var(--side, 0px), 1fr);
   gap: 8px;
   align-items: stretch;
   pointer-events: none;
   z-index: 10;
 }
-#bar > * { pointer-events: auto; }
+.lead { display: flex; gap: 8px; min-width: 0; }
+.lead > *, .find, .tools { pointer-events: auto; }
 
 .brand {
   display: flex;
@@ -199,7 +204,6 @@ code, .mono { font-family: var(--mono); font-size: 12px; }
   display: flex;
   align-items: center;
   min-width: 0;
-  max-width: 30%;
   padding: 0 6px;
   overflow: hidden;
   white-space: nowrap;
@@ -224,9 +228,7 @@ code, .mono { font-family: var(--mono); font-size: 12px; }
 
 .find {
   position: relative;
-  flex: 1 1 280px;
-  min-width: 120px;
-  max-width: 560px;
+  min-width: 0;
   display: flex;
   align-items: center;
   padding: 0 10px 0 34px;
@@ -331,6 +333,7 @@ code, .mono { font-family: var(--mono); font-size: 12px; }
   font-weight: 500;
   white-space: nowrap;
 }
+.seg button > svg.i { margin: 0 6px 0 -2px; vertical-align: -4px; }
 .seg button:hover { color: var(--ink); background: var(--hover); }
 .seg button:disabled { opacity: 0.4; cursor: not-allowed; background: none; }
 .seg button[aria-pressed="true"] { color: var(--ink); background: var(--raise); box-shadow: 0 0 0 1px var(--edge-2) inset; }
@@ -356,10 +359,10 @@ code, .mono { font-family: var(--mono); font-size: 12px; }
 .icon-btn:hover { color: var(--ink); }
 /* A group shares one surface; its parts are split by hairlines. */
 .tools .group { display: flex; align-items: stretch; }
-.tools .group > .seg + .seg { border-left: 1px solid var(--edge); }
 .tools .group.icons { padding: 3px; gap: 2px; }
 .tools .group.icons .icon-btn { width: 36px; min-width: 36px; border: 0; border-radius: 7px; background: none; }
 .tools .group.icons .icon-btn:hover { background: var(--hover); }
+.tools .group.icons .icon-btn[aria-pressed="true"] { color: var(--ink); background: var(--raise); box-shadow: 0 0 0 1px var(--edge-2) inset; }
 svg.i { width: 17px; height: 17px; stroke: currentColor; fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; flex: none; }
 
 /* ── Buttons ── */
@@ -448,6 +451,8 @@ a.btn { text-decoration: none; }
 .section > h3 .count { color: var(--ink-2); letter-spacing: 0; }
 .muted { color: var(--ink-3); }
 .note { color: var(--ink-2); font-size: 12.5px; }
+.note > svg.i { margin-right: 6px; vertical-align: -4px; }
+.note > b.glyph { display: inline-block; width: 24px; text-align: center; color: var(--ink); }
 .empty { color: var(--ink-3); padding: 18px 4px; text-align: center; }
 
 /* Check */
@@ -744,6 +749,7 @@ textarea:focus, input:focus { border-color: var(--accent); }
 .ref .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ref .n { color: var(--ink-3); font-size: 12px; font-variant-numeric: tabular-nums; }
 .ref .k { color: var(--ink-3); font-size: 11px; width: 58px; flex: none; overflow: hidden; text-overflow: ellipsis; }
+.ref .g { color: var(--ink-3); width: 16px; flex: none; text-align: center; }
 .ref .sw { width: 8px; height: 8px; border-radius: 2px; flex: none; }
 .acts-bar { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 14px; }
 .outline .ref { padding-left: calc(6px + var(--d, 0) * 14px); }
@@ -758,7 +764,6 @@ textarea:focus, input:focus { border-color: var(--accent); }
   height: var(--foot-h);
   display: flex;
   gap: 8px;
-  justify-content: space-between;
   pointer-events: none;
   z-index: 9;
 }
@@ -778,7 +783,7 @@ textarea:focus, input:focus { border-color: var(--accent); }
 .legend .sw { width: 9px; height: 9px; border-radius: 2px; flex: none; }
 .legend .ramp { width: 90px; height: 8px; border-radius: 4px; }
 .legend .title { color: var(--ink); font-weight: 550; }
-.status { flex: none; white-space: nowrap; overflow: hidden; }
+.status { flex: none; margin-left: auto; white-space: nowrap; overflow: hidden; }
 .status .live { width: 7px; height: 7px; border-radius: 50%; background: var(--good); }
 .status .live.off { background: var(--critical); }
 .status .bar { width: 90px; height: 4px; border-radius: 4px; background: var(--raise); overflow: hidden; }
@@ -870,7 +875,9 @@ dialog.box {
 }
 dialog.box[open] { display: flex; flex-direction: column; }
 dialog::backdrop { background: var(--shade); backdrop-filter: blur(3px); }
-.box-head { padding: 16px 18px 6px; }
+.box-head { padding: 16px 52px 6px 18px; }
+.box-x { position: absolute; top: 10px; right: 10px; width: 32px; min-width: 32px; height: 32px; border: 0; border-radius: 7px; background: none; }
+.box-x:hover { background: var(--hover); }
 .box-head h2 { margin: 0; font-size: 17px; font-weight: 650; letter-spacing: -0.015em; }
 .box-head p { margin: 4px 0 0; color: var(--ink-2); }
 .box-body { padding: 12px 18px; overflow: auto; flex: 1; }
@@ -902,22 +909,13 @@ dialog::backdrop { background: var(--shade); backdrop-filter: blur(3px); }
 /* ── Tabs (narrow screens) ── */
 
 .tabs { display: none; }
-.view-btn { display: none !important; }
 
-/* City adds a Height picker: the breadcrumbs give way first, then the
-   Detail label (its choices name themselves). */
-@media (max-width: 1560px) and (min-width: 1241px) {
-  body.city #crumbs { display: none; }
-}
-@media (max-width: 1400px) and (min-width: 1241px) {
-  body.city .tools .group > .seg:first-child .label { display: none; }
-}
+/* Fit and help sit in the bar and the brand opens a folder; the View sheet
+   keeps all three for phones. */
+body:not(.narrow) .view-sheet .tool-row { display: none; }
 
 @media (max-width: 1240px) and (min-width: 761px) {
   #crumbs { display: none; }
-  .tools .opt { display: none; }
-  .view-btn { display: grid !important; }
-  .view-btn[aria-pressed="true"] { color: var(--accent); }
 }
 
 @media (max-width: 760px) {
@@ -925,7 +923,6 @@ dialog::backdrop { background: var(--shade); backdrop-filter: blur(3px); }
   #crumbs, .tools .wide, .find kbd { display: none; }
   .brand b { display: none; }
   .brand { padding: 0 11px; }
-  .find { flex: 1 1 auto; }
   .tools { gap: 6px; }
   #foot { bottom: calc(60px + env(safe-area-inset-bottom)); height: 30px; }
   body.sheet-open #foot { display: none; }

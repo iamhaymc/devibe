@@ -73,6 +73,12 @@ async function shot(name, p = page) {
 
 const center = (key, p = page) => p.evaluate((k) => window.devibe.centerOf(k), key);
 const state = (fn, p = page) => p.evaluate(fn);
+const emit = (type, data, p = page) => p.evaluate(([t, d]) => window.devibe.hub.emit(t, d), [type, data]);
+// Find sits centered on the window, whatever the bar holds on either side.
+async function findCentered(p, width) {
+  const f = await p.locator('#find').boundingBox();
+  assert.ok(Math.abs(f.x + f.width / 2 - width / 2) <= 1, `Find center ${f.x + f.width / 2} of ${width}`);
+}
 
 async function launch() {
   return chromium.launch({ args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'] });
@@ -128,6 +134,7 @@ describe('devibe client', () => {
     const stats = await state(() => window.devibe.state.model.stats);
     assert.ok(stats.files >= 30 && stats.lines > 600);
     assert.match(await page.locator('#status').textContent(), /files/);
+    await findCentered(page, DESKTOP.width);
     await shot('02-map');
   });
 
@@ -198,16 +205,25 @@ describe('devibe client', () => {
     await page.keyboard.press('2');
     await idle();
     assert.equal(await state(() => window.devibe.state.lay.kind), 'graph');
+    // Layout, Detail, Color, and Links are in the View panel, not the bar.
+    assert.equal(await page.locator('#tools [aria-label="Layout"], #tools .seg, #tools select').count(), 0);
     await shot('08-graph');
-    await page.locator('#tools select').first().selectOption('type');
+    await emit('view.detail', 'type');
     await idle();
     assert.ok(await state(() => [...window.devibe.state.lay.rect.keys()].some((id) => window.devibe.state.T.N[id].kind === 'type')));
     await shot('09-graph-types');
-    await page.locator('#tools select').first().selectOption('file');
+    await emit('view.detail', 'file');
     await idle();
     // A bright link ends on its target's edge, where its arrowhead's tip is.
     await page.evaluate(() => { const d = window.devibe; d.hub.emit('pick.set', { ids: [d.state.T.byKey.get('acme-shop/web/src/cart.ts')] }); });
     await idle();
+    // Link directions and kind toggles sit in their own pill, apart from the color legend.
+    assert.match(await page.locator('#links').textContent(), /^Links.*outgoing.*incoming/);
+    assert.ok(await page.locator('#links button.kind').count() >= 2);
+    assert.equal(await page.locator('#legend .kind, #legend .key', { hasText: 'outgoing' }).count(), 0);
+    // The Outline marks each symbol with its glyph; the form is spelled out in the tooltip.
+    const outline = await page.locator('#info .outline .ref .g').evaluateAll((gs) => gs.map((g) => `${g.textContent} ${g.title}`));
+    assert.ok(outline.includes('◆ class') && outline.includes('ƒ method'), outline.join(', '));
     const edge = await page.evaluate(() => {
       const d = window.devibe, to = 'acme-shop/web/src/utils.ts';
       const pts = d.linkPoints('acme-shop/web/src/cart.ts', to);
@@ -244,13 +260,13 @@ describe('devibe client', () => {
 
   test('colors the map by complexity, issues, and age', async () => {
     await page.keyboard.press('Escape');
-    await page.locator('#tools select').nth(1).selectOption('cx');
+    await emit('view.paint', 'cx');
     await shot('12-complexity');
-    await page.locator('#tools select').nth(1).selectOption('issues');
+    await emit('view.paint', 'issues');
     await shot('13-issues');
-    await page.locator('#tools select').nth(1).selectOption('age');
+    await emit('view.paint', 'age');
     await shot('14-age');
-    await page.locator('#tools select').nth(1).selectOption('lang');
+    await emit('view.paint', 'lang');
   });
 
   test('check panel spotlights a rule on the map', async () => {
@@ -277,16 +293,51 @@ describe('devibe client', () => {
     assert.equal(await state(() => window.devibe.state.set.nodes.length), 3);
     await page.keyboard.press('r');
     await page.waitForFunction(() => window.devibe.state.model.marks['acme-shop/web/src/checkout.ts'] === 'ok');
-    await page.locator('#tools select').nth(1).selectOption('review');
+    await emit('view.paint', 'review');
     assert.doesNotMatch(await page.locator('#dock .section h3').first().textContent(), /\b0%/);
     await shot('16-review');
     await page.keyboard.press('Escape');
-    await page.locator('#tools select').nth(1).selectOption('lang');
+    await emit('view.paint', 'lang');
   });
 
   test('asks the agent and stages its edit', async () => {
-    await page.evaluate(() => { const d = window.devibe; d.hub.emit('pick.set', { ids: [d.state.T.byKey.get('acme-shop/web/src/utils.ts#slugify')] }); d.flyTo(d.state.T.byKey.get('acme-shop/web/src/utils.ts'), 0); });
-    await page.locator('#dock .seg button', { hasText: 'Change' }).click();
+    // The bar has one toggle per panel: a click opens it, a second closes it.
+    const panel = (name) => page.locator(`#tools button[aria-label="${name}"]`);
+    const shown = () => page.locator('#dock').evaluate((d) => (d.classList.contains('shut') ? null : d.querySelector('.panel-head b')?.textContent));
+    const slugify = () => page.evaluate(() => { const d = window.devibe; d.hub.emit('pick.set', { ids: [d.state.T.byKey.get('acme-shop/web/src/utils.ts#slugify')] }); d.flyTo(d.state.T.byKey.get('acme-shop/web/src/utils.ts'), 0); });
+    // Groups: View with Fit all, the other panels, then settings and help.
+    assert.deepEqual(await page.locator('#tools .group').evaluateAll((gs) => gs.map((g) => [...g.querySelectorAll('button')].map((b) => b.getAttribute('aria-label')))), [['View', 'Fit all'], ['Check', 'Selection', 'Change'], ['Settings', 'Help']]);
+    // Selection opens empty from the bar, and its ✕ closes it until the next selection.
+    await emit('pick.clear');
+    assert.equal(await page.locator('#info').isHidden(), true);
+    await panel('Selection').click();
+    assert.match(await page.locator('#info').textContent(), /Tap something/);
+    assert.equal(await panel('Selection').getAttribute('aria-pressed'), 'true');
+    await page.locator('#info button[aria-label="Close panel"]').click();
+    assert.equal(await page.locator('#info').isHidden(), true);
+    await slugify();
+    assert.equal(await page.locator('#info').isVisible(), true);
+    assert.equal(await panel('Selection').getAttribute('aria-pressed'), 'true');
+    // Turned off, it stays off through new selections.
+    await panel('Selection').click();
+    assert.equal(await page.locator('#info').isHidden(), true);
+    await slugify();
+    assert.equal(await page.locator('#info').isHidden(), true, 'off stays off');
+    assert.equal(await panel('Selection').getAttribute('aria-pressed'), 'false');
+    await panel('Selection').click();
+    assert.equal(await page.locator('#info').isVisible(), true);
+    await panel('View').click();
+    assert.equal(await shown(), 'View');
+    assert.equal(await page.locator('#dock .tool-row').isVisible(), false, 'fit and help are in the bar on wide screens; the brand opens a folder');
+    assert.equal(await panel('View').getAttribute('aria-pressed'), 'true');
+    assert.equal(await panel('Check').getAttribute('aria-pressed'), 'false');
+    await panel('View').click();
+    assert.equal(await shown(), null, 'a second click closes it');
+    await panel('Change').click();
+    assert.equal(await shown(), 'Change');
+    // The Act bar stays centered on the window, whichever panels are open.
+    const bar = await page.locator('#act').boundingBox();
+    assert.ok(Math.abs(bar.x + bar.width / 2 - DESKTOP.width / 2) <= 1, `Act bar center ${bar.x + bar.width / 2}`);
     await page.locator('#prompt').fill('Rename slugify to makeSlug');
     await page.locator('#dock .btn.primary', { hasText: 'Send' }).click();
     await page.waitForFunction(() => !window.devibe.state.agent.busy && window.devibe.state.stage.items.length === 1);
@@ -307,7 +358,7 @@ describe('devibe client', () => {
   test('previews staged changes on the map, applies, and undoes', async () => {
     await page.locator('#dock button', { hasText: 'Preview' }).click();
     await page.waitForFunction(() => window.devibe.state.model.preview);
-    await page.locator('#tools select').nth(1).selectOption('stage');
+    await emit('view.paint', 'stage');
     await idle();
     assert.ok(await state(() => window.devibe.state.T.byKey.has('acme-shop/web/src/utils.ts#makeSlug')));
     await shot('19-preview');
@@ -318,7 +369,7 @@ describe('devibe client', () => {
     await page.locator('#dock button', { hasText: 'Undo last apply' }).click();
     await page.waitForFunction(() => window.devibe.state.stage.undo === 0);
     assert.ok(!fs.readFileSync(path.join(dir, 'web/src/utils.ts'), 'utf8').includes('makeSlug'));
-    await page.locator('#tools select').nth(1).selectOption('lang');
+    await emit('view.paint', 'lang');
   });
 
   test('renames a function everywhere with F2', async () => {
@@ -356,21 +407,33 @@ describe('devibe client', () => {
   test('settings test the model connection', async () => {
     await page.locator('#tools button[aria-label="Settings"]').click();
     await page.locator('#setup-box').waitFor({ state: 'visible' });
+    // Selecting a field's text to replace it, and letting go past the dialog's edge, keeps it open.
+    const field = await page.locator('#setup-box input[type="url"]').boundingBox();
+    const edge = await page.locator('#setup-box').boundingBox();
+    await page.mouse.move(field.x + field.width - 10, field.y + field.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(edge.x - 40, field.y + field.height / 2, { steps: 6 });
+    await page.mouse.up();
+    assert.equal(await page.locator('#setup-box').evaluate((d) => d.open), true, 'a drag that ends on the backdrop does not close it');
     const parser = page.locator('#setup-box [aria-label="Parser"]');
     assert.equal(await parser.locator('button[aria-pressed="true"]').textContent(), 'Built-in');
     assert.equal(await parser.locator('button', { hasText: 'Tree-sitter' }).isEnabled(), true, 'the optional package is installed');
+    assert.equal(await page.locator('#setup-box').getByLabel('Max file size').inputValue(), '2000');
     await page.locator('#setup-box button', { hasText: 'Test' }).click();
     await page.locator('#setup-box', { hasText: 'Connected' }).waitFor();
     await page.locator('#setup-box .box-body').evaluate((el) => { el.scrollTop = el.scrollHeight; });
     await shot('22-settings');
-    await page.locator('#setup-box button', { hasText: 'Cancel' }).click();
+    await page.locator('#setup-box button[aria-label="Close"]').click();
+    assert.equal(await page.locator('#setup-box').evaluate((d) => d.open), false, 'the ✕ closes it');
   });
 
   test('help lists keys and gestures', async () => {
     await page.keyboard.press('?');
     await page.locator('#keys-box').waitFor({ state: 'visible' });
     await shot('23-help');
-    await page.locator('#keys-box button', { hasText: 'Done' }).click();
+    // A click that starts and ends on the backdrop closes it.
+    await page.mouse.click(8, 450);
+    assert.equal(await page.locator('#keys-box').evaluate((d) => d.open), false, 'a backdrop click closes it');
   });
 
   test('light theme', async () => {
@@ -386,6 +449,7 @@ describe('devibe client', () => {
     await phone.waitForFunction(() => window.devibe.state.model);
     await idle(phone);
     assert.ok(await phone.locator('#tabs').isVisible());
+    await findCentered(phone, 390);
     await shot('25-phone-map', phone);
     await phone.locator('#tabs button', { hasText: 'Check' }).tap();
     await shot('26-phone-check', phone);
@@ -395,6 +459,7 @@ describe('devibe client', () => {
     await phone.locator('#info').waitFor({ state: 'visible' });
     await shot('27-phone-info', phone);
     await phone.locator('#tabs button', { hasText: 'View' }).tap();
+    assert.ok(await phone.locator('#dock .tool-row').isVisible(), 'phones keep open, fit, and help in the View sheet');
     await shot('28-phone-view', phone);
     await phone.context().close();
   });
@@ -403,6 +468,7 @@ describe('devibe client', () => {
     const tablet = await newPage({ viewport: { width: 1024, height: 1366 }, hasTouch: true });
     await tablet.waitForFunction(() => window.devibe.state.model);
     await idle(tablet);
+    await findCentered(tablet, 1024);
     await shot('29-tablet', tablet);
     await tablet.context().close();
   });
@@ -410,7 +476,6 @@ describe('devibe client', () => {
   // ───── City 2.0, sets, and Act ─────
 
   const S0 = 'acme-shop/';
-  const emit = (type, data, p = page) => p.evaluate(([t, d]) => window.devibe.hub.emit(t, d), [type, data]);
   const pickKeys = (keys, p = page) => p.evaluate((ks) => { const d = window.devibe; d.hub.emit('pick.set', { ids: ks.map((k) => d.state.T.byKey.get(k)) }); }, keys);
   const setOf = (p = page) => p.evaluate(() => JSON.parse(JSON.stringify(window.devibe.setOf())));
   const cityOf = (p = page) => p.evaluate(() => { const c = window.devibe.city; return { open: c.open, glass: c.glass, towers: c.towers, flat: c.flat, ghosts: c.ghosts, cut: c.cut, instances: c.instances }; });
@@ -541,7 +606,7 @@ describe('devibe client', () => {
 
   test('a legend color selects that group at the current detail', async () => {
     await reset();
-    await page.locator('#tools select').nth(1).selectOption('issues');
+    await emit('view.paint', 'issues');
     await page.locator('#legend button.key', { hasText: 'High' }).click();
     const want = await state(() => { const T = window.devibe.state.T; return T.N.filter((n) => n.kind === 'file' && T.sev[n.id] === 3).map((n) => n.key).sort(); });
     const s = await setOf();
@@ -549,7 +614,7 @@ describe('devibe client', () => {
     assert.ok(want.length >= 2);
     assert.equal(s.recipe[0].legend.key, 'sev:3');
     await shot('36-legend-select');
-    await page.locator('#tools select').nth(1).selectOption('lang');
+    await emit('view.paint', 'lang');
   });
 
   test('find runs queries, selects all with Alt+Enter, and lists actions after >', async () => {
@@ -755,7 +820,7 @@ describe('devibe client', () => {
     await page.keyboard.press('1');
     await idle();
     await pickKeys([`${S0}web/src/cart.ts#Cart.total`]);
-    await page.locator('#tools select').nth(1).selectOption('reach');
+    await emit('view.paint', 'reach');
     await page.locator('#legend button[data-key="reach:in2"]').click();
     let s = await setOf();
     assert.ok(s.nodes.includes(`${S0}web/src/cart.ts#Cart.total`) && s.nodes.includes(`${S0}web/src/checkout.ts`) && s.nodes.includes(`${S0}web/src/app.ts`), JSON.stringify(s.nodes));
@@ -764,7 +829,7 @@ describe('devibe client', () => {
     llm.seen.length = 0;
     await untilDone(() => page.locator('#act button[data-act="tests"]').click());
     assert.match(lastAsk(), /^Add focused unit tests[\s\S]*Selection \(\d+ parts\)/);
-    await page.locator('#tools select').nth(1).selectOption('lang');
+    await emit('view.paint', 'lang');
 
     // W2: clean up the checkout flow: query → Select all → City → isolate →
     // Tidy one by one → Preview → Code sheet diff → Apply.

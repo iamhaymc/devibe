@@ -65,7 +65,8 @@ const CACHE_DIRS = new Set(['.git', 'node_modules', 'bower_components', 'jspm_pa
 const BUILD_DIRS = new Set(['dist', 'build', 'out', 'target', 'bin', 'obj', 'vendor', 'coverage', '.nyc_output', 'htmlcov']);
 const isCacheDir = (name) => CACHE_DIRS.has(name) || name.endsWith('.egg-info');
 const isSkipDir = (name) => isCacheDir(name) || BUILD_DIRS.has(name);
-const MAX_BYTES = 2_000_000;
+// Default file size limit in KB (1,000 bytes): larger files are listed, not read.
+const MAX_KB = 2000;
 const MAX_FILES = 40_000;
 
 export function langOf(rel) {
@@ -276,7 +277,9 @@ const SPACE_RE = {
 };
 const PARENS_OK = new Set(['kt', 'scala', 'cs', 'java', 'ts', 'js', 'vue', 'dart', 'php', 'swift']);
 const LINE_DECL = new Set(['kt', 'scala', 'swift', 'dart']);
-const CALL_RE = /([A-Za-z_$~][\w$]*(?:::~?[A-Za-z_]\w*)*)\s*(<(?:[^<>;{}()]|<[^<>;{}()]*>)*>)?\s*\(/g;
+// The space before `<...>` sits inside its group: two `\s*` in a row split a
+// long blank run (a masked comment) every way, quadratic in its length.
+const CALL_RE = /([A-Za-z_$~][\w$]*(?:::~?[A-Za-z_]\w*)*)(?:\s*(<(?:[^<>;{}()]|<[^<>;{}()]*>)*>))?\s*\(/g;
 const AFTER_RE = /^\s*(?:(?:const|noexcept|override|final|mutable|volatile|async|throws\s+[\w.<>, ]+?|where\s+[^{;]+?|:\s*[^{;]+?|->\s*[^{;]+?)\s*)*(\{|=>)/;
 // Declarations without a body: interface members, abstract methods, C prototypes.
 const PROTO_RE = /^\s*(?:(?:const|noexcept|override|throws\s+[\w.<>, ]+?|->\s*[^{;=]+?|=\s*0)\s*)*;/;
@@ -2852,8 +2855,9 @@ async function pool(list, size, fn) {
 }
 
 // `trees` (core_tree.mjs) parses the languages whose grammars load; facts
-// read by the other parser are read again.
-export async function scanRepo(repo, onStep, { trees = null } = {}) {
+// read by the other parser are read again. Files over `maxKB` are listed with
+// an estimated line count (`big`), and read again once a new limit fits them.
+export async function scanRepo(repo, onStep, { trees = null, maxKB = MAX_KB } = {}) {
   const t0 = performance.now();
   const stats = {};
   const rels = await listFiles(repo.root, stats);
@@ -2872,11 +2876,13 @@ export async function scanRepo(repo, onStep, { trees = null } = {}) {
     if (done % 100 === 0) onStep?.({ repo: repo.name, done, total });
     const old = repo.facts.get(rel);
     const parser = tree.has(langOf(rel)) ? 'tree' : undefined;
-    if (old && old.mtime === st.mtimeMs && old.bytes === st.size && (old.parser === parser || old.gen)) { seen.add(rel); return; }
+    const big = st.size > maxKB * 1000;
+    if (old && old.mtime === st.mtimeMs && old.bytes === st.size && !!old.big === big && (old.parser === parser || old.gen)) { seen.add(rel); return; }
     if (repo.skip.get(rel) === st.mtimeMs) return;
-    if (st.size > MAX_BYTES) {
+    if (big) {
       seen.add(rel);
-      repo.facts.set(rel, { rel, lang: langOf(rel), lines: Math.round(st.size / 40), gen: true, syms: [], imports: [], words: new Map(), vars: [], refs: [], marks: [], copy: null, mtime: st.mtimeMs, bytes: st.size, hash: '' });
+      repo.texts.delete(rel);
+      repo.facts.set(rel, { rel, lang: langOf(rel), lines: Math.round(st.size / 40), gen: true, big, syms: [], imports: [], words: new Map(), vars: [], refs: [], marks: [], copy: null, mtime: st.mtimeMs, bytes: st.size, hash: '' });
       return;
     }
     let buf;
@@ -2893,6 +2899,9 @@ export async function scanRepo(repo, onStep, { trees = null } = {}) {
   for (const rel of [...repo.facts.keys()]) if (!seen.has(rel)) { repo.facts.delete(rel); repo.texts.delete(rel); }
   repo.git = await readGit(repo.root);
   stats.files = repo.facts.size;
+  stats.big = 0;
+  for (const f of repo.facts.values()) if (f.big) stats.big++;
+  stats.maxKB = maxKB;
   stats.ms = Math.round(performance.now() - t0);
   stats.tree = Object.fromEntries([...tree].map((l) => [l, Math.round((trees.stats.ms[l] ?? 0) - (treeMs[l] ?? 0))]));
   repo.stats = stats;
@@ -2904,13 +2913,14 @@ function logScan(repo) {
   if (!process.env.DEVIBE_DEBUG) return;
   const s = repo.stats ?? {};
   const tree = Object.entries(s.tree ?? {}).map(([l, ms]) => `${l} ${ms} ms`).join(', ');
-  process.stderr.write(`[devibe] scan ${repo.name}: ${s.files} files in ${s.ms} ms; skipped ${s.cache} in cache folders, ${s.build} in build folders, ${s.ignored} by .gitignore${tree ? `; tree-sitter: ${tree}` : ''}\n`);
+  process.stderr.write(`[devibe] scan ${repo.name}: ${s.files} files in ${s.ms} ms; skipped ${s.cache} in cache folders, ${s.build} in build folders, ${s.ignored} by .gitignore; listed ${s.big} over ${s.maxKB} KB unread${tree ? `; tree-sitter: ${tree}` : ''}\n`);
 }
 
 // ───────────────────────────── Config and ledger ─────────────────────────────
 
-export const DEFAULTS = { endpoint: 'https://openrouter.ai/api/v1', model: 'deepseek/deepseek-v4.1-flash', apiKey: '', style: '', maxTurns: 40, parser: 'built-in', recent: [] };
+export const DEFAULTS = { endpoint: 'https://openrouter.ai/api/v1', model: 'deepseek/deepseek-v4.1-flash', apiKey: '', style: '', maxTurns: 40, parser: 'built-in', maxKB: MAX_KB, recent: [] };
 export const PARSERS = ['built-in', 'tree-sitter'];
+const kbOf = (v) => Math.max(1, Math.min(100_000, Math.round(+v) || MAX_KB));
 
 export function homeDir() { return process.env.DEVIBE_HOME || path.join(os.homedir(), '.devibe'); }
 
@@ -2924,6 +2934,7 @@ export function loadConfig(home = homeDir()) {
     model: env.DEVIBE_MODEL || saved.model || DEFAULTS.model,
     apiKey: env.DEVIBE_API_KEY || saved.apiKey || env.OPENROUTER_API_KEY || env.OPENAI_API_KEY || '',
     parser: [env.DEVIBE_PARSER, saved.parser].find((x) => PARSERS.includes(x)) ?? DEFAULTS.parser,
+    maxKB: kbOf([env.DEVIBE_MAX_KB, saved.maxKB].map(Number).find((n) => n > 0)),
   };
 }
 
@@ -3003,7 +3014,7 @@ export class Workspace {
 
   async scan(list = this.repos) {
     for (const repo of list) {
-      await scanRepo(repo, (step) => this.emit('scan.step', step), { trees: this.treesFor() });
+      await scanRepo(repo, (step) => this.emit('scan.step', step), { trees: this.treesFor(), maxKB: this.config.maxKB });
       logScan(repo);
       if (this.watching) this.watch(repo);
     }
@@ -3349,19 +3360,22 @@ export class Workspace {
     this.build();
   }
 
-  // Returns true when the parser changed: the repos need a rescan.
+  // Returns true when the parser or the file size limit changed: the repos need a rescan.
   setConfig(patch) {
     for (const k of ['endpoint', 'model', 'apiKey', 'style', 'maxTurns']) if (patch[k] !== undefined) this.config[k] = k === 'maxTurns' ? Math.max(1, Math.min(200, +patch[k] || 40)) : String(patch[k]);
     const reparse = PARSERS.includes(patch.parser) && patch.parser !== this.config.parser;
     if (reparse) this.config.parser = patch.parser;
+    const maxKB = patch.maxKB === undefined ? this.config.maxKB : kbOf(patch.maxKB);
+    const resize = maxKB !== this.config.maxKB;
+    this.config.maxKB = maxKB;
     this.saveConfig();
-    return reparse;
+    return reparse || resize;
   }
   saveConfig() { try { saveConfig(this.config, this.home); } catch { /* read-only home */ } }
   configState() {
-    const { endpoint, model, style, maxTurns, parser, recent } = this.config;
+    const { endpoint, model, style, maxTurns, parser, maxKB, recent } = this.config;
     const trees = { ready: (this.trees ?? makeTrees()).ready, langs: Object.keys(GRAMMARS).map((id) => LANG[id].name) };
-    return { endpoint, model, style, maxTurns, parser, trees, recent, hasKey: !!this.config.apiKey, repos: this.repos.map((r) => ({ name: r.name, root: r.root })) };
+    return { endpoint, model, style, maxTurns, parser, maxKB, trees, recent, hasKey: !!this.config.apiKey, repos: this.repos.map((r) => ({ name: r.name, root: r.root })) };
   }
 }
 

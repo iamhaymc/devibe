@@ -10,7 +10,7 @@ import path from 'node:path';
 import { Workspace, makeSample } from '../app/server.mjs';
 import {
   index, liftTo, partsAt, liftGraph, levels, strongGroups, loopsAt, fanin, emptySet, grow, boundary, reach, parseQuery, matchQuery,
-  classify, classMatches, replay, recipeName, linkIndices, seedIds, setSummary, cleanSet,
+  classify, classMatches, replay, recipeName, linkIndices, seedIds, setSummary, cleanSet, glyphOf, RANK,
 } from '../app/core_sets.mjs';
 
 const tmp = (name) => fs.mkdtempSync(path.join(os.tmpdir(), `devibe-${name}-`));
@@ -27,6 +27,17 @@ describe('sets', () => {
     space = new Workspace({ home: tmp('home'), watch: false });
     await space.open(dir);
     I = index(space.model);
+  });
+
+  test('each symbol form has one short glyph, with fallbacks by kind', () => {
+    const g = (form, kind = 'type') => glyphOf({ form, kind });
+    assert.deepEqual([g('function', 'func'), g('method', 'func'), g('procedure', 'func'), g('ctor', 'func')], ['ƒ', 'ƒ', 'ƒ', '⊕']);
+    assert.deepEqual([g('class'), g('interface'), g('trait'), g('struct'), g('enum'), g('impl'), g('type')], ['◆', '◇', '◇', '■', '≡', '◈', 'τ']);
+    assert.equal(g('record  struct'), '■', 'spaces in a form fold');
+    assert.deepEqual([g('namespace', 'space'), g('table'), g('view')], ['{}', '▦', '▤']);
+    assert.deepEqual([g('h1', 'part'), g('h4', 'part'), g('key', 'part')], ['#', '#', '•']);
+    assert.deepEqual([g('trigger', 'func'), g(undefined, 'type'), g(undefined, 'space')], ['ƒ', '◆', '{}'], 'unknown forms fall back by kind');
+    for (const n of I.N) if (RANK[n.kind] > RANK.file) assert.ok(glyphOf(n).length <= 2, `${n.key}: ${glyphOf(n)}`);
   });
 
   test('indexes the model once per model', () => {

@@ -10,6 +10,22 @@ export const LEVEL_RANK = { high: 3, medium: 2, low: 1 };
 // levels, lifting, and growth unless an operation is about them.
 export const STATIC = new Set(['import', 'call', 'use', 'base']);
 export const SET_CAP = 5000;
+
+// One glyph per symbol form, so labels spend their room on names. Forms come
+// from source keywords, so unknown ones fall back by kind.
+export const GLYPHS = {
+  function: 'ƒ', method: 'ƒ', def: 'ƒ', procedure: 'ƒ', ctor: '⊕',
+  class: '◆', 'record class': '◆', object: '◆', actor: '◆',
+  interface: '◇', protocol: '◇', trait: '◇', annotation: '◇',
+  struct: '■', record: '■', 'record struct': '■', union: '■',
+  enum: '≡', 'enum class': '≡', impl: '◈', extension: '◈', mixin: '◈', type: 'τ',
+  namespace: '{}', module: '{}', mod: '{}', table: '▦', view: '▤', key: '•',
+};
+const KIND_GLYPHS = { func: 'ƒ', type: '◆', space: '{}', part: '•' };
+export function glyphOf(n) {
+  const form = n.form?.replace(/\s+/g, ' ');
+  return GLYPHS[form] ?? (/^h\d$/.test(form) ? '#' : KIND_GLYPHS[n.kind] ?? '•');
+}
 export const PATH_CAP = 200;
 
 // ───────────────────────────── Index ─────────────────────────────
