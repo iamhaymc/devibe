@@ -195,7 +195,8 @@ export function makeCity(env) {
     for (const m of [opaque, glass]) { m.frustumCulled = false; m.visible = false; R.base.add(m); }
     opaque.renderOrder = 1;
     glass.renderOrder = 6;
-    Object.assign(C, { geo, solid, ghost, opaque, glass, cap: 0 });
+    // The meshes live apart from C.glass, which holds per-instance glass amounts.
+    Object.assign(C, { geo, solid, ghost, meshes: [opaque, glass], cap: 0 });
   }
 
   function ensure(n) {
@@ -1242,14 +1243,14 @@ export function makeCity(env) {
     C.open = new Set([...C.openKeys].map((k) => env.idOf(k)).filter((id) => id >= 0 && next.files.has(id)));
     C.flat.file = C.flat.key ? env.idOf(C.flat.key) : -1;
     C.cut = new Set();
-    C.opaque.visible = C.glass.visible = true;
+    for (const m of C.meshes) m.visible = true;
     sync({ dur: motion ? dur ?? (prev?.kind === 'city' ? 400 : 720) : 0, prev: prev && prev.kind !== 'city' && motion ? prev : null });
     plan();
   }
 
   function hide() {
-    if (!C.opaque) return;
-    C.opaque.visible = C.glass.visible = false;
+    if (!C.meshes) return;
+    for (const m of C.meshes) m.visible = false;
     clearTimeout(C.cutTimer);
     C.cutTimer = 0;
     C.anim = null;
@@ -1319,6 +1320,7 @@ export function makeCity(env) {
     get open() { return [...C.open].map((id) => state.T.N[id].key); },
     get sky() { return { cells: C.sky ? C.sky.nx * C.sky.ny : 0, boxes: C.sky?.count ?? 0, maxZ: C.sky?.maxZ ?? 0 }; },
     get instances() { return C.inst.length; },
+    get shown() { return C.meshes?.some((m) => m.visible) ?? false; },
     get towers() { return C.inst.filter((b) => b.part === 'tower' && !b.closing).length; },
     get glass() { return C.inst.filter((b, i) => b.part === 'shell' && C.glass[i * 2 + 1] > 0.5).map((b) => state.T.N[b.file].key); },
     get ghosts() { return C.inst.filter((b, i) => C.ghostOf?.[i]).length; },

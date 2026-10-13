@@ -40,7 +40,7 @@ npm install
 node app/server.mjs ~/code/my-repo ~/code/other-repo --open
 ```
 
-Then open http://127.0.0.1:4747. No repo handy? `node app/server.mjs --demo` opens a small sample shop with planted problems.
+Then open http://127.0.0.1:4747. No repo handy? `node app/server.mjs --demo` opens a small sample shop with planted problems. In VS Code, run the `serve` task (**Tasks: Run Task**) and enter folders or keep `--demo`.
 
 ### Set up the agent
 
@@ -55,6 +55,12 @@ node app/server.mjs ~/code/my-repo
 
 Or set them in **Settings** in the app (saved to `~/.devibe/config.json`). Check the exact model name on your provider's model list.
 
+### Exact parsing (optional)
+
+`npm install` also installs `@vscode/tree-sitter-wasm`, an optional package. Pick **Tree-sitter** under **Settings → Parser** (or set `DEVIBE_PARSER=tree-sitter`) to read exact syntax trees for C#, C/C++, Go, Java, JavaScript, PHP, Python, Ruby, Rust, and TypeScript: macros, templates, decorators, and nested lambdas come out right, at the cost of slower scans. The built-in parser stays the default and covers every language.
+
+devibe skips cache and package folders (`node_modules`, `.venv`, `__pycache__`, …) everywhere, build output (`dist`, `build`, `bin`, …) unless it is committed, and anything a `.gitignore` excludes.
+
 ## Use it
 
 - **Zoom** with the wheel or a pinch. Keep zooming into a file to read its code. **Double-click** to zoom to a part, or to open code you can already read in the Code sheet.
@@ -63,7 +69,7 @@ Or set them in **Settings** in the app (saved to `~/.devibe/config.json`). Check
 - **Grow** the set with `]` (what it uses) and `[` (what uses it), or Path, Loop, Copies, Tests, and Inside in the panel. Sets made from a query, rule, or grow stay live as the code changes; **Sets** in the panel keeps them by name.
 - **Find** (`/`) by name, file text, or a query like `kind:func cx>10 in:web`. Type `>` for every action on the set.
 - **Color** (`C`) by language, size, complexity, churn, age, used by, issues, review, changes, or reach from the set.
-- **Act**: the bar under the map offers the actions that fit the set. Agent actions run all at once or one by one; Explain never edits. Rename (`F2`), move (drag the grip onto a folder, or a function onto a file), and delete without the agent.
+- **Act**: the bar under the map offers the actions that fit the set. Agent actions run all at once or one by one; Explain never edits. Rename (`F2`), move (drag the grip onto a folder, or a function onto a file), and delete without the agent. Moves fix JS/TS, Python, and C# imports and namespaces as they go.
 - **Check** lists findings by rule. Click a rule to light it up; Select all to act on every hit.
 - **Review**: press `R` to mark the set reviewed. Marks go stale when the code changes.
 - **Staged changes**: open a file in the Code sheet to edit lines in place or revert one hunk, preview the reshaped map (nothing moves; deleted files stay as ghosts), apply, undo.
@@ -74,7 +80,7 @@ Press `?` in the app for all keys.
 
 ```sh
 npm test               # every suite
-npm run test:server    # unit tests (parsing, checks, stage, sockets, agent loop, sets)
+npm run test:server    # unit tests (parsing, Tree-sitter, receivers, checks, stage, sockets, agent loop, sets, link routes)
 npm run test:client    # browser tests and workflows; rewrites the images in test/shots/
 ```
 

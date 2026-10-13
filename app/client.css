@@ -332,6 +332,7 @@ code, .mono { font-family: var(--mono); font-size: 12px; }
   white-space: nowrap;
 }
 .seg button:hover { color: var(--ink); background: var(--hover); }
+.seg button:disabled { opacity: 0.4; cursor: not-allowed; background: none; }
 .seg button[aria-pressed="true"] { color: var(--ink); background: var(--raise); box-shadow: 0 0 0 1px var(--edge-2) inset; }
 .seg .label { padding: 0 6px 0 8px; color: var(--ink-3); font-size: 12px; }
 .seg select {

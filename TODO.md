@@ -2,11 +2,9 @@
 
 Sorted by impact, highest first.
 
-- [perf] Ignore common cache and package directories such as `.venv`, `node_modules`, `__pycache__`, etc. Consider driving exclusions using .gitignore entries.
-- [parsing] Add Tree-sitter (WASM) parsers as an option for exact syntax trees where the built-in heuristics fall short: receiver-typed calls, macros, generics-heavy C++, decorators, nested lambdas.
-- [linking] Resolve calls by receiver type (`store.Find` → `IOrderStore.Find`) instead of by name, to cut false and missing call links in large OOP code.
 - [repos] Open remote repos: clone a git URL into a cache folder, keep it fetched, and show the branch.
-- [reshape] Fix imports on mechanical moves without the agent (JS/TS relative imports, Python modules, C# namespaces), so "Move only" leaves the code building.
+- [reshape] Fix imports on moves for more languages: Java and Kotlin packages, Go import paths, Rust `mod` and `use`, C/C++ includes; and JS default and namespace imports of a moved symbol.
+- [parsing] Tree-sitter grammars for Kotlin, Swift, Scala, and Dart, which `@vscode/tree-sitter-wasm` does not ship.
 - [agent] Add an opt-in tool to run the build or tests (with approval per command), so the agent can verify its staged edits.
 - [checks] Make rule thresholds and rule on/off editable in Settings, with an optional per-repo `.devibe.json` the team can share.
 - [checks] Add architecture rules: "folder A must not depend on folder B", drawn as allowed and forbidden bands in Layers.

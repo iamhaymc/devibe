@@ -13,6 +13,7 @@ import { execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { index, liftTo, isUnder, walk, boundary, linkIndices, strongGroups, STATIC as STATIC_KINDS } from './core_sets.mjs';
+import { makeTrees, GRAMMARS } from './core_tree.mjs';
 
 export { strongGroups };
 
@@ -58,7 +59,12 @@ export const LANG = Object.fromEntries(LANGS.map((L) => [L.id, L]));
 const BY_EXT = new Map(LANGS.flatMap((L) => L.exts.map((e) => [e, L.id])));
 const BY_BASE = { dockerfile: 'sh', makefile: 'sh', 'cmakelists.txt': 'sh', gemfile: 'rb', rakefile: 'rb', license: 'text', 'readme': 'md' };
 const LOCK_FILES = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'cargo.lock', 'go.sum', 'poetry.lock', 'composer.lock', 'gemfile.lock', 'packages.lock.json', 'bun.lockb', 'uv.lock', 'pipfile.lock']);
-const SKIP_DIRS = new Set(['.git', 'node_modules', 'bower_components', 'dist', 'build', 'out', 'target', 'bin', 'obj', 'vendor', '.venv', 'venv', '__pycache__', '.next', '.nuxt', '.cache', 'coverage', '.idea', '.vs', '.gradle', '.terraform', '.devibe', 'Pods', 'DerivedData']);
+// Cache and package folders are never source, even when committed. Build
+// output folders are skipped unless their files are tracked in git.
+const CACHE_DIRS = new Set(['.git', 'node_modules', 'bower_components', 'jspm_packages', '.yarn', '.pnpm-store', '.venv', 'venv', '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache', '.tox', '.nox', '.eggs', 'site-packages', '.ipynb_checkpoints', '.next', '.nuxt', '.svelte-kit', '.angular', '.parcel-cache', '.turbo', '.cache', '.gradle', '.terraform', '.dart_tool', '.pub-cache', '.devibe', '.idea', '.vs', 'Pods', 'DerivedData']);
+const BUILD_DIRS = new Set(['dist', 'build', 'out', 'target', 'bin', 'obj', 'vendor', 'coverage', '.nyc_output', 'htmlcov']);
+const isCacheDir = (name) => CACHE_DIRS.has(name) || name.endsWith('.egg-info');
+const isSkipDir = (name) => isCacheDir(name) || BUILD_DIRS.has(name);
 const MAX_BYTES = 2_000_000;
 const MAX_FILES = 40_000;
 
@@ -277,11 +283,12 @@ const PROTO_RE = /^\s*(?:(?:const|noexcept|override|throws\s+[\w.<>, ]+?|->\s*[^
 const PROTO_LANGS = new Set(['cs', 'java', 'c', 'cpp', 'rs', 'php', 'dart']);
 const TYPEY_PRE = /^[\s\w<>[\],.?*&:@$]*[\w>\]?*&]\s*$/;
 
-export function readSymbols(text, masked, langId) {
+// `raw` takes symbols from another parser (Tree-sitter) in the same shape.
+export function readSymbols(text, masked, langId, raw = null) {
   const L = LANG[langId];
   if (!L) return [];
-  let raw;
-  if (langId === 'md') raw = mdSymbols(text);
+  if (raw) raw = raw.map((s) => ({ ...s }));
+  else if (langId === 'md') raw = mdSymbols(text);
   else if (langId === 'yaml') raw = yamlSymbols(text);
   else if (langId === 'json') raw = jsonSymbols(text);
   else if (langId === 'toml') raw = tomlSymbols(text);
@@ -653,10 +660,14 @@ function nestSymbols(raw, masked, lang, lines) {
     s.up = stack.length ? stack.at(-1) : -1;
     stack.push(i);
   }
-  // Go methods live outside their type: attach them by receiver name.
+  // Go methods live outside their type: attach them by receiver name, or
+  // keep the receiver type as `of` when it is declared in another file.
   if (lang === 'go') {
     const types = new Map(list.map((s, i) => [s.kind === 'type' ? s.name : null, i]));
-    for (const s of list) if (s.recv && types.has(s.recv) && s.up < 0) s.up = types.get(s.recv);
+    for (const s of list) {
+      if (s.recv && types.has(s.recv) && s.up < 0) s.up = types.get(s.recv);
+      else if (s.recv && s.up < 0) s.of = s.recv;
+    }
   }
   for (const s of list) {
     s.lines = s.to - s.from + 1;
@@ -750,6 +761,176 @@ export function readImports(text, masked, langId) {
   return out.slice(0, 400);
 }
 
+// ───────────────────────────── Receivers ─────────────────────────────
+// Typed names and member accesses, for linking `store.Find` to the Find of
+// store's type. vars: [name, type, line] for fields, parameters, and locals;
+// `@name` is a this/self member assigned or promoted in a method. refs:
+// [chain, name, line] for `a.b.Name`, `a->Name`, `A::Name`, where chain is
+// the receiver: `this` (this, self, Self, $this), `super` (super, base,
+// parent), or names joined by dots.
+
+// Built-in types: a receiver of one of these has no members in the repo.
+const PRIMS = new Set('bool boolean byte char double float int long short string uint object dynamic decimal sbyte ushort ulong nint nuint str bytes list dict set tuple number any unknown never bigint symbol i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize f32 f64 rune error'.split(' '));
+const NOT_TYPE = new Set([...[...KEYWORDS].filter((w) => !PRIMS.has(w)), 'auto', 'typename', 'template', 'operator', 'friend', 'sizeof', 'global', 'echo', 'print', 'puts', 'goto', 'co_return', 'co_await', 'co_yield', 'unsigned', 'signed', 'register', 'inline', 'explicit', 'constexpr', 'noexcept', 'mutable']);
+const SELF_HEADS = new Set(['this', 'self', 'Self', '$this', 'static', 'cls', 'Me']);
+const SUPER_HEADS = new Set(['super', 'base', 'parent', 'MyBase']);
+const TYPE_SRC = String.raw`[A-Za-z_]\w*(?:\s*(?:\.|::)\s*[A-Za-z_]\w*)*(?:\s*<(?:[^<>;{}()=]|<(?:[^<>;{}()=]|<[^<>;{}()=]*>)*>)*>)?(?:\s*\[\s*\])*[?*&]*`;
+// `Type name` in C-like languages: fields, parameters, locals, patterns.
+const TYPED_RE = new RegExp(String.raw`(?<![\w$.>:@\\])(?<type>${TYPE_SRC})\s+(?:[*&]\s*)*(?<name>[A-Za-z_]\w*)\s*(?=[=;,)]|\{|$)`, 'gmd');
+// `name: Type`: parameters, fields, and annotated locals, found from each `:`:
+// the type after it, the name before it on the same line. A modifier before
+// the name (`constructor(private store: Store)`) also makes it a member.
+const ANNOT_TYPE = new RegExp(String.raw`\s*(?:&\s*(?:'\w+\s+)?(?:mut\s+)?|\*)?(${TYPE_SRC}|[A-Za-z_]\w*\[[^\]\n]*\])\s*(?=[=;,)|{}]|$)`, 'my');
+const ANNOT_NAME = /(?:^|[(,]|\b(?:let|const|var|val|readonly|private|public|protected|static|declare|override|lateinit|mut|pub(?:\([^)]*\))?|internal|open|final|lazy)\s)\s*(?<mods>(?:(?:private|public|protected|readonly|override|val|var|mut)\s+)*)(?<self>(?:self|this)\s*\.\s*)?(?<name>[A-Za-z_$][\w$]*)\s*[?!]?\s*$/d;
+// `x = new Foo(`, `self.x = Foo()`, `@x = Foo.new`, `x := &Foo{`, `let x = Foo::new(`, found
+// from each `=`: the constructor after it, the name before it on the same line.
+const NEW_TYPE = /\s*(?:await\s+)?(?<new>new\s+)?&?\s*(?<type>(?:[A-Za-z_]\w*\s*(?:\.|::)\s*)*[A-Za-z_]\w*)\s*(?<gen><[^;(){}=\n]*>)?\s*(?:\s*(?:\.|::)\s*(?:new|from|default)\b|\(|\{)/y;
+const NEW_NAME = /(?:^|[^\w$.>])(?:(?:this|self|\$this)\s*(?:\.|->)\s*(?<self>[A-Za-z_]\w*)|@(?<ivar>[A-Za-z_]\w*)|(?<dollar>\$)?(?<name>[A-Za-z_]\w*)(?:\s*,\s*[A-Za-z_]\w*)*)\s*(?::\s*[^=;\n]+?)?\s*:?$/d;
+const PHP_TYPED_RE = /(?<![\w\\$])\??(?<type>[A-Za-z_\\][\w\\]*)\s+&?(?:\.\.\.)?\$(?<name>[A-Za-z_]\w*)/gd;
+const GO_FUNC_RE = /\bfunc\s*(?:\(\s*(?<recv>[A-Za-z_]\w*)\s+\*?\s*(?<rtype>[\w.]+)[^)]*\)\s*)?(?:[A-Za-z_]\w*)?\s*(?:\[[^\]]*\])?\s*\((?<params>[^)]*)\)/gd;
+const GO_VAR_RE = /^[ \t]*(?:var[ \t]+)?(?<names>[A-Za-z_]\w*(?:[ \t]*,[ \t]*[A-Za-z_]\w*)*)[ \t]+(?:\*|\[\]|map\[[^\]\n]*\])*(?<type>[A-Za-z_][\w.]*)[ \t]*(?:`[^`\n]*`)?[ \t]*(?:=[^=]|$)/gmd;
+// Languages that construct without `new`: Capitalized calls and struct literals.
+const BARE_NEW = new Set(['py', 'kt', 'scala', 'swift', 'rs', 'go', 'rb', 'dart', 'cpp']);
+
+function normType(raw) {
+  let t = raw.replace(/\s+/g, '');
+  for (let i = 0; i < 3; i++) {
+    const m = /^(?:[\w.:]*?(?:\.|::))?(?:Optional|Option|Box|Rc|Arc|RefCell|Cell|Mutex|RwLock|Lazy|Nullable|unique_ptr|shared_ptr|weak_ptr|make_unique|make_shared|scoped_ptr|Ptr)[<[](.+)[>\]][?*&[\]]*$/.exec(t);
+    if (!m) break;
+    t = m[1].split(',')[0];
+  }
+  t = t.replace(/[<[].*$/s, '').replace(/[?*&[\]]+$/, '').replace(/^[&*]+/, '');
+  const seg = t.split(/\.|::|\\/).pop();
+  return seg && /^[A-Za-z_]\w*$/.test(seg) && !NOT_TYPE.has(seg) ? seg : null;
+}
+
+// The type a constructor call makes: the last Capitalized segment of a path
+// (`Foo::new` → Foo, `models.Store` → Store), Go's `NewFoo` → Foo, and the
+// argument of `make_unique<Foo>`.
+function madeType(raw, lang, isNew, gen) {
+  const segs = raw.split(/\s*(?:\.|::)\s*/);
+  const last = segs.at(-1);
+  if (/^make_(?:unique|shared)$/.test(last)) return gen ? normType(gen.slice(1, -1)) : null;
+  if (isNew) return normType(last);
+  if (lang === 'go') return /^New[A-Z]/.test(last) ? last.slice(3) : /^[A-Z]/.test(last) ? last : null;
+  const cap = segs.findLast((x) => /^[A-Z]/.test(x));
+  return cap && !NOT_TYPE.has(cap) ? cap : null;
+}
+
+export function readTyped(masked, lang) {
+  const L = LANG[lang];
+  if (!L || L.data || ['html', 'css', 'sql', 'sh'].includes(lang)) return { vars: [], refs: [] };
+  const starts = lineStarts(masked);
+  const found = [];
+  const seen = new Set();
+  const add = (name, type, at) => {
+    if (!type || !name || NOT_TYPE.has(name.replace(/^@/, ''))) return;
+    const line = lineAt(starts, at);
+    const key = `${name}|${line}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    found.push([name, type, line, at]);
+  };
+  const at = (m, group) => m.indices.groups[group][0];
+  if (['cs', 'java', 'dart', 'c', 'cpp'].includes(lang)) {
+    for (const m of masked.matchAll(TYPED_RE)) {
+      const head = m.groups.type.replace(/\s+/g, '').split(/[<[]/)[0].split(/\.|::/)[0];
+      if (!NOT_TYPE.has(head)) add(m.groups.name, normType(m.groups.type), at(m, 'name'));
+    }
+  }
+  if (['ts', 'vue', 'py', 'kt', 'scala', 'swift', 'rs'].includes(lang)) {
+    for (let i = masked.indexOf(':'); i >= 0; i = masked.indexOf(':', i + 1)) {
+      if (masked[i + 1] === ':' || masked[i - 1] === ':') { i++; continue; }
+      ANNOT_TYPE.lastIndex = i + 1;
+      const tm = ANNOT_TYPE.exec(masked);
+      if (!tm) continue;
+      const t = normType(tm[1]);
+      if (!t || (!/^[A-Z]/.test(t) && !PRIMS.has(t))) continue;
+      const from = Math.max(masked.lastIndexOf('\n', i) + 1, i - 160);
+      const m = ANNOT_NAME.exec(masked.slice(from, i));
+      if (!m) continue;
+      const { mods, self, name } = m.groups;
+      const pos = from + m.indices.groups.name[0];
+      if (!self) add(name, t, pos);
+      if (self || /\b(?:private|public|protected|readonly)\b/.test(mods)) add('@' + name, t, pos);
+    }
+  }
+  if (lang === 'php') {
+    for (const m of masked.matchAll(PHP_TYPED_RE)) if (!NOT_TYPE.has(m.groups.type.toLowerCase())) add(m.groups.name, normType(m.groups.type), at(m, 'name'));
+  }
+  if (lang === 'go') {
+    for (const m of masked.matchAll(GO_FUNC_RE)) {
+      if (m.groups.recv) add(m.groups.recv, normType(m.groups.rtype), at(m, 'recv'));
+      // `a, b Price`: a name without a type takes the next one's.
+      const params = [];
+      let pos = at(m, 'params');
+      for (const p of m.groups.params.split(',')) { params.push([p, pos]); pos += p.length + 1; }
+      let type = null;
+      const typed = [];
+      for (const [p, from] of params.reverse()) {
+        const pm = /^(\s*)([A-Za-z_]\w*)(?:\s+(?:\.\.\.)?\*?(?:\[\])*([\w.]+))?/.exec(p);
+        if (!pm) continue;
+        if (pm[3]) type = normType(pm[3]);
+        typed.push([pm[2], type, from + pm[1].length]);
+      }
+      for (const [n, t, from] of typed.reverse()) add(n, t, from);
+    }
+    for (const m of masked.matchAll(GO_VAR_RE)) {
+      const t = normType(m.groups.type);
+      let pos = at(m, 'names');
+      for (const n of m.groups.names.split(',')) { add(n.trim(), t, pos + n.length - n.trimStart().length); pos += n.length + 1; }
+    }
+  }
+  const bare = BARE_NEW.has(lang);
+  for (let i = masked.indexOf('='); i >= 0; i = masked.indexOf('=', i + 1)) {
+    const next = masked[i + 1];
+    if (next === '=' || next === '>' || '=!<>+-*/%&|^~?.'.includes(masked[i - 1])) { if (next === '=') i++; continue; }
+    let k = i + 1;
+    while (masked[k] === ' ' || masked[k] === '\t') k++;
+    if (!bare && !masked.startsWith('new', k) && !masked.startsWith('await', k) && !masked.startsWith('std', k) && !masked.startsWith('make_', k)) continue;
+    NEW_TYPE.lastIndex = i + 1;
+    const tm = NEW_TYPE.exec(masked);
+    if (!tm) continue;
+    const { new: isNew, type, gen } = tm.groups;
+    if (isNew ? ['py', 'go', 'rs', 'rb'].includes(lang) : !bare && !/make_(?:unique|shared)$/.test(type)) continue;
+    const t = madeType(type, lang, !!isNew, gen);
+    if (!t) continue;
+    const from = Math.max(masked.lastIndexOf('\n', i) + 1, i - 160);
+    const m = NEW_NAME.exec(masked.slice(from, i));
+    if (!m) continue;
+    const g = m.groups;
+    if ((g.ivar && lang !== 'rb') || (g.dollar && lang !== 'php')) continue;
+    const group = g.self ? 'self' : g.ivar ? 'ivar' : 'name';
+    add(g.self || g.ivar ? '@' + (g.self ?? g.ivar) : g.name, t, from + m.indices.groups[group][0]);
+  }
+  found.sort((a, b) => a[3] - b[3]);
+  return { vars: found.map(([n, t, l]) => [n, t, l]), refs: readRefs(masked, lang, starts) };
+}
+
+function readRefs(masked, lang, starts) {
+  const head = lang === 'rb' ? String.raw`@{1,2}[A-Za-z_]\w*|[A-Za-z_]\w*` : lang === 'php' ? String.raw`\$?[A-Za-z_]\w*` : String.raw`super\s*\(\s*\)|[A-Za-z_$][\w$]*`;
+  const re = new RegExp(String.raw`(?<![\w$.>:)\]\\@])(${head})((?:\s*(?:[?!]?\.|->|::)\s*[A-Za-z_$][\w$]*)+)`, 'g');
+  const out = [];
+  for (const m of masked.matchAll(re)) {
+    let h = m[1].replace(/\s+/g, '');
+    let chain;
+    if (lang === 'rb' && h.startsWith('@')) chain = 'this.' + h.replace(/^@+/, '');
+    else {
+      if (lang === 'php') h = h === '$this' ? 'this' : h.replace(/^\$/, '');
+      chain = SELF_HEADS.has(h) ? 'this' : SUPER_HEADS.has(h) || h === 'super()' ? 'super' : h;
+      if (chain !== 'this' && chain !== 'super' && KEYWORDS.has(chain) && !PRIMS.has(chain)) continue;
+    }
+    const base = m.index + m[1].length;
+    for (const s of m[2].matchAll(/(?:[?!]?\.|->|::)\s*([A-Za-z_$][\w$]*)/g)) {
+      const name = s[1];
+      if (name.length >= 3 && !KEYWORDS.has(name)) out.push([chain, name, lineAt(starts, base + s.index + s[0].length - name.length)]);
+      chain += '.' + name;
+      if (out.length >= 20000) return out;
+    }
+  }
+  return out;
+}
+
 // ───────────────────────────── File facts ─────────────────────────────
 
 const TEST_RE = /(?:^|\/)(?:tests?|spec|specs|__tests__|testing)(?:\/|$)|[._-](?:test|spec)s?\.\w+$|Tests?\.\w+$|_test\.go$|(?:^|\/)test_[^/]+\.py$/i;
@@ -778,7 +959,10 @@ const STUB_RE = /\b(?:NotImplementedException|NotImplementedError|UnsupportedOpe
 const TODO_RE = /\b(TODO|FIXME|HACK|XXX)\b:?\s*(.{0,80})/;
 const CODEY_RE = /[;{}]\s*$|^\s*(?:if|for|while|return|var|let|const|def|import|from|class|public|private|int|string|console\.|print\(|System\.|await|throw)\b|^\s*[\w.]+\s*\(.*\)\s*;?\s*$|^\s*[\w.[\]]+\s*=\s*\S/;
 
-export function readFacts(rel, text) {
+// `trees` (from core_tree.mjs makeTrees) reads symbols and receiver facts
+// from a syntax tree when its grammar is loaded; the facts then say
+// `parser: 'tree'`. Imports, words, marks, and copies stay built in.
+export function readFacts(rel, text, { trees = null } = {}) {
   const lang = langOf(rel);
   const L = LANG[lang];
   const masked = maskCode(text, lang);
@@ -789,13 +973,30 @@ export function readFacts(rel, text) {
   const avg = lineCount ? text.length / lineCount : 0;
   const gen = LOCK_FILES.has(base) || /\.min\.\w+$|\.(?:g|generated|designer)\.\w+$|\.pb\.go$|_pb2\.py$/.test(base) || GEN_HEAD.test(head) || (avg > 300 && lineCount > 2);
   const test = TEST_RE.test(rel);
-  const syms = gen ? [] : readSymbols(text, masked, lang);
+  const tree = gen ? null : trees?.read(text, lang, rel) ?? null;
+  const syms = gen ? [] : readSymbols(text, masked, lang, tree?.syms);
   const imports = gen ? [] : readImports(text, masked, lang);
   const pkg = ['java', 'kt', 'scala', 'go'].includes(lang) ? /^\s*package\s+([\w.]+)/m.exec(masked)?.[1] ?? null : null;
   const words = gen ? new Map() : readWords(L?.data ? text : masked);
   const marks = gen ? [] : readMarks(rel, lang, text, masked, lines, syms, test);
   const copy = gen || L?.data ? null : readNorm(lines, masked.split('\n'));
-  return { rel, lang, lines: lineCount, gen, test, syms, imports, pkg, words, marks, copy, hash: sha1(text), empty: !text.trim() };
+  const { vars, refs } = gen ? { vars: [], refs: [] } : tree ? treeTyped(tree, lang) : readTyped(masked, lang);
+  return { rel, lang, lines: lineCount, gen, test, syms, imports, pkg, words, vars, refs, marks, copy, hash: sha1(text), empty: !text.trim(), parser: tree ? 'tree' : undefined };
+}
+
+// Tree-sitter's typed names carry the type as written, or the constructor of
+// a construction; reduce both to one type name as the built-in reader does.
+function treeTyped(tree, lang) {
+  const vars = [];
+  const seen = new Set();
+  for (const [name, text, line, made] of tree.vars) {
+    if (!text || NOT_TYPE.has(name.replace(/^@/, ''))) continue;
+    const type = made ? madeType(text.replace(/<[\s\S]*$/, ''), lang, made === 'new', null) : normType(text);
+    if (!type || seen.has(`${name}|${line}`)) continue;
+    seen.add(`${name}|${line}`);
+    vars.push([name, type, line]);
+  }
+  return { vars, refs: tree.refs.filter(([, name]) => !KEYWORDS.has(name)) };
 }
 
 function readWords(code) {
@@ -966,7 +1167,7 @@ export function buildModel(repos, { ledgers = new Map(), stage = null, preview =
         const chain = (s.up >= 0 ? nodes[up].key.split('#')[1] + '.' : '') + s.name;
         const n = (counts.get(chain) ?? 0) + 1;
         counts.set(chain, n);
-        const sid = add({ kind: s.kind, form: s.form, name: s.name, up, key: `${fkey}#${chain}${n > 1 ? '~' + n : ''}`, path: rel, lang: f.lang, from: s.from, to: s.to, lines: s.lines, cx: s.cx, nest: s.nest, args: s.args, head: s.head, bases: s.bases?.length ? s.bases : undefined });
+        const sid = add({ kind: s.kind, form: s.form, name: s.name, up, key: `${fkey}#${chain}${n > 1 ? '~' + n : ''}`, path: rel, lang: f.lang, from: s.from, to: s.to, lines: s.lines, cx: s.cx, nest: s.nest, args: s.args, head: s.head, bases: s.bases?.length ? s.bases : undefined, of: s.of });
         fileOf[sid] = fid;
         rec.syms.push(sid);
       }
@@ -1040,16 +1241,40 @@ export function buildModel(repos, { ledgers = new Map(), stage = null, preview =
     return typesOnly || cands.every((t) => nodes[t].kind === 'type') ? cands : [];
   };
 
-  // References and calls
+  // References and calls. A member access (`store.Find`) links to the member
+  // of the receiver's type when that type is known, and to nothing when the
+  // type is external; other words link by name.
+  const members = makeReceivers(nodes, files, fileOf, decls, family);
   for (const rec of files) {
     if (LANG[rec.f.lang]?.data || rec.f.lang === 'css') continue;
+    const refs = new Map();
+    for (const [chain, name, line] of rec.f.refs ?? []) {
+      if (!decls.has(name)) continue;
+      let at = refs.get(name);
+      if (!at) refs.set(name, (at = new Map()));
+      if (!at.has(line)) at.set(line, []);
+      at.get(line).push(chain);
+    }
     for (const [w, lines] of rec.f.words) {
       const targets = decls.get(w);
-      if (!targets || targets.length > 4) continue;
+      if (!targets) continue;
+      const at = refs.get(w);
       for (const line of lines) {
         const src = rec.owner[line] ?? rec.id;
-        if (nodes[src].name === w) continue;
-        for (const t of pick(rec, targets, false)) {
+        const own = nodes[src].name;
+        if (own === w || own.endsWith('::' + w)) continue;
+        const hits = new Set();
+        let byName = true;
+        const chains = at?.get(line);
+        if (chains) {
+          byName = false;
+          for (const chain of chains) {
+            const found = members(rec, line, chain, w);
+            if (found) for (const t of found) hits.add(t); else byName = true;
+          }
+        }
+        if (byName && targets.length <= 4) for (const t of pick(rec, targets, false)) hits.add(t);
+        for (const t of hits) {
           if (t === src || isUnder(src, t) || isUnder(t, src)) continue;
           if (fileOf[t] === rec.id && nodes[t].from === line) continue;
           link(src, t, nodes[t].kind === 'func' ? 'call' : 'use', 1, line);
@@ -1254,6 +1479,200 @@ export function buildModel(repos, { ledgers = new Map(), stage = null, preview =
   return model;
 }
 
+// Languages where a Capitalized receiver that is neither a variable nor a
+// declared type is an external type (`Console.WriteLine`, `Path.home()`).
+const PASCAL = new Set(['cs', 'java', 'kt', 'scala', 'swift', 'dart', 'py', 'rb', 'php', 'rs', 'cpp']);
+// Languages where a built-in type name cannot be a variable (`string.Join`).
+const PRIM_HEADS = new Set(['cs', 'java', 'kt', 'scala', 'swift', 'dart', 'c', 'cpp']);
+const JS_GLOBALS = new Set(['Math', 'JSON', 'Object', 'Array', 'Promise', 'Date', 'Number', 'String', 'Boolean', 'Reflect', 'Intl', 'Symbol', 'Map', 'Set', 'console', 'document', 'window', 'process', 'Buffer', 'navigator', 'location', 'globalThis']);
+const EXT = 'ext';
+
+// Resolves a member access `chain.name` on a line of a file to the members it
+// can mean: null when the receiver's type is unknown (link by name instead),
+// [] when the type is known but declares no such member (an external type or
+// a member inherited from one), else the member ids.
+//
+// Receiver types are sets of type (or namespace) node ids. A type name picks
+// the nearest declarations, as names do: the same file, then imported files,
+// then the same folder; more than 3 left is ambiguous (unknown). Partial C#
+// classes, Rust impl blocks, and Swift and Ruby reopened types pool their
+// members. The type comes from typed names in scope (innermost function, then
+// the type's fields, then the file), `this` and `super`, field chains
+// (`this.store`, `s.store`), and type names for static access. Base types are
+// searched when a type lacks the member.
+function makeReceivers(nodes, files, fileOf, decls, family) {
+  const recOf = new Map(files.map((r) => [r.id, r]));
+  const typeIds = new Map();
+  const typeOf = new Int32Array(nodes.length).fill(-1);
+  const scopeOf = new Int32Array(nodes.length).fill(-1);
+  const nsHeads = new Set();
+  const symNames = new Set();
+  for (const n of nodes) {
+    if (n.kind === 'type' || n.kind === 'space') {
+      const k = n.name.split(/::|\.|\\/).pop();
+      if (!typeIds.has(k)) typeIds.set(k, []);
+      typeIds.get(k).push(n.id);
+    }
+    if (n.kind === 'space') nsHeads.add(n.name.split(/[.:\\]/)[0]);
+    if (n.from) symNames.add(n.name.split('::').pop());
+    if (n.up > 0 && n.from) {
+      const p = nodes[n.up];
+      typeOf[n.id] = p.kind === 'type' ? n.up : typeOf[n.up];
+      scopeOf[n.id] = p.kind === 'type' || p.kind === 'space' ? n.up : scopeOf[n.up];
+    }
+  }
+  const vars = (rec) => {
+    if (!rec.vars) {
+      rec.vars = new Map();
+      for (const [name, type, line] of rec.f.vars ?? []) {
+        if (!rec.vars.has(name)) rec.vars.set(name, []);
+        rec.vars.get(name).push([type, line]);
+      }
+    }
+    return rec.vars;
+  };
+  const dirOf = (id) => nodes[fileOf[id]].up;
+  const pooled = (t) => { const n = nodes[t]; return n.lang === 'rs' || n.lang === 'swift' || n.lang === 'rb' || (n.lang === 'cs' && /\bpartial\b/.test(n.head ?? '')); };
+  // Same-named partial classes, impl blocks, and reopened types.
+  const pool = (ids) => {
+    const out = new Set(ids);
+    for (const t of ids) if (pooled(t)) for (const x of typeIds.get(nodes[t].name.split(/::|\.|\\/).pop()) ?? []) if (nodes[x].lang === nodes[t].lang && pooled(x)) out.add(x);
+    return out;
+  };
+  // A type name as written on a line of a file: the nearest declarations (in
+  // the file, the innermost enclosing scope that declares it), EXT for
+  // built-in and undeclared Capitalized names, null when unknown.
+  const resolve = (name, rec, fam, line = 0) => {
+    let ids = (typeIds.get(name) ?? []).filter((t) => family(nodes[t].lang) === fam);
+    if (ids.length > 1) {
+      let same = ids.filter((t) => fileOf[t] === rec.id);
+      if (same.length > 1 && line) {
+        for (let p = rec.owner[line] ?? rec.id; p >= 0; p = nodes[p].up) {
+          const here = same.filter((t) => nodes[t].up === p);
+          if (here.length) { same = here; break; }
+          if (p === rec.id) break;
+        }
+      }
+      const imp = ids.filter((t) => rec.imports.has(fileOf[t]));
+      const near = ids.filter((t) => dirOf(t) === nodes[rec.id].up);
+      ids = same.length ? same : imp.length ? imp : near.length ? near : ids;
+    }
+    if (ids.length > 3 && new Set(ids.map((t) => fileOf[t])).size > 1) return null;
+    if (ids.length) return pool(ids);
+    if (symNames.has(name)) return null;
+    return PRIMS.has(name) || /^[A-Z]/.test(name) ? EXT : null;
+  };
+  const ownerName = (t) => nodes[t].of ?? (nodes[t].name.includes('::') ? nodes[t].name.split('::').at(-2) : null);
+  const selfIds = (rec, line, fam) => {
+    const o = rec.owner[line] ?? rec.id;
+    const t = nodes[o].kind === 'type' ? o : typeOf[o];
+    if (t >= 0) return pool([t]);
+    for (let p = o; p > 0 && p !== rec.id; p = nodes[p].up) { const own = ownerName(p); if (own) return resolve(own, rec, fam, line); }
+    return null;
+  };
+  const baseIds = (ids, fam) => {
+    const out = new Set();
+    let ext = false;
+    for (const t of ids) {
+      for (const b of nodes[t].bases ?? []) {
+        const r = resolve(b, recOf.get(fileOf[t]), fam, nodes[t].from);
+        if (r === EXT) ext = true; else if (r) for (const x of r) if (!ids.has(x)) out.add(x);
+      }
+    }
+    return out.size ? out : ext ? EXT : null;
+  };
+  // The innermost scope that types the name decides. A name given several
+  // types there (reassigned across branches) may be any of them; if one of
+  // them is unknown or external, so is the name.
+  const varType = (rec, line, name, fam) => {
+    const list = vars(rec).get(name);
+    if (!list) return null;
+    for (let p = rec.owner[line] ?? rec.id; ; p = nodes[p].up) {
+      const top = p === rec.id;
+      const n = nodes[p];
+      const here = list.filter(([, l]) => (top || (l >= n.from && l <= n.to)) && (!(top || n.kind === 'type') || (rec.owner[l] ?? rec.id) === p));
+      if (here.length) {
+        const out = new Set();
+        for (const [type, l] of here) {
+          const r = resolve(type, rec, fam, l);
+          if (here.length === 1 || r === EXT) return here.length === 1 ? r : null;
+          if (!r) return null;
+          for (const x of r) out.add(x);
+        }
+        return out;
+      }
+      if (top) return null;
+    }
+  };
+  const fieldType = (ids, seg, fam, depth = 0) => {
+    const out = new Set();
+    let ext = false;
+    for (const t of ids) {
+      const rec = recOf.get(fileOf[t]);
+      const n = nodes[t];
+      const own = (vars(rec).get(seg) ?? []).filter(([, l]) => l >= n.from && l <= n.to && rec.owner[l] === t);
+      const set = (vars(rec).get('@' + seg) ?? []).filter(([, l]) => l >= n.from && l <= n.to);
+      for (const [type, l] of [...own, ...set]) {
+        const r = resolve(type, rec, fam, l);
+        if (r === EXT) ext = true; else if (r) for (const x of r) out.add(x);
+      }
+    }
+    if (out.size) return out;
+    if (ext) return EXT;
+    const nested = (typeIds.get(seg) ?? []).filter((x) => ids.has(scopeOf[x]));
+    if (nested.length) return new Set(nested);
+    const bases = depth < 4 ? baseIds(ids, fam) : null;
+    return bases && bases !== EXT ? fieldType(bases, seg, fam, depth + 1) : null;
+  };
+  const chainTypes = (rec, line, chain, fam) => {
+    const segs = chain.split('.');
+    const head = segs[0];
+    const lang = rec.f.lang;
+    let cur;
+    if (head === 'this') cur = selfIds(rec, line, fam);
+    else if (head === 'super') { const self = selfIds(rec, line, fam); cur = self && self !== EXT ? baseIds(self, fam) : null; }
+    else {
+      cur = varType(rec, line, head, fam);
+      // No typed name: a type or namespace for static access, or an external one.
+      if (cur == null && !vars(rec).has(head)) {
+        const r = resolve(head, rec, fam, line);
+        const ext = (PRIM_HEADS.has(lang) && PRIMS.has(head)) || (PASCAL.has(lang) && /^[A-Z]/.test(head) && !nsHeads.has(head)) || (fam === 'js' && JS_GLOBALS.has(head));
+        cur = r && r !== EXT ? r : ext ? EXT : null;
+      }
+    }
+    for (const seg of segs.slice(1)) {
+      if (cur == null || cur === EXT) break;
+      cur = fieldType(cur, seg, fam);
+    }
+    return cur ?? null;
+  };
+  const membersOf = (ids, w, fam) => {
+    const seen = new Set();
+    let level = ids;
+    for (let depth = 0; level && level !== EXT && level.size && depth < 6; depth++) {
+      for (const t of level) seen.add(t);
+      const names = new Set([...level].map((t) => nodes[t].name.split(/::|\.|\\/).pop()));
+      const dirs = new Set([...level].map(dirOf));
+      const hits = (decls.get(w) ?? []).filter((t) => family(nodes[t].lang) === fam && (level.has(scopeOf[t]) || (names.has(ownerName(t)) && (!nodes[t].of || dirs.has(dirOf(t))))));
+      if (hits.length) return hits;
+      const next = baseIds(level, fam);
+      level = next && next !== EXT ? new Set([...next].filter((t) => !seen.has(t))) : null;
+    }
+    // A class without the member means a field or property: no link. A type
+    // alias or interface lists members as properties, which are not symbols.
+    return [...seen].some((t) => nodes[t].form === 'type' || nodes[t].form === 'interface') ? null : [];
+  };
+  const cache = new Map();
+  return (rec, line, chain, w) => {
+    const fam = family(rec.f.lang);
+    const key = `${rec.id}|${line}|${chain}`;
+    let types = cache.get(key);
+    if (types === undefined) { types = chainTypes(rec, line, chain, fam); cache.set(key, types); }
+    if (types == null) return null;
+    return types === EXT ? [] : membersOf(types, w, fam);
+  };
+}
+
 function timeOf(repo, rel, f) {
   if (repo.git?.dirty.has(rel)) return Math.floor((f.mtime ?? Date.now()) / 1000);
   const t = repo.git?.files.get(rel)?.time;
@@ -1287,8 +1706,9 @@ function viewFacts(repo, stage, preview) {
     if (item.repo !== repo) continue;
     if (item.after == null) out.delete(item.rel);
     else {
-      const f = repo.preview.get(item.rel + ':' + sha1(item.after)) ?? readFacts(item.rel, item.after);
-      repo.preview.set(item.rel + ':' + sha1(item.after), f);
+      const key = `${item.rel}:${repo.trees ? 'tree' : ''}:${sha1(item.after)}`;
+      const f = repo.preview.get(key) ?? readFacts(item.rel, item.after, { trees: repo.trees });
+      repo.preview.set(key, f);
       out.set(item.rel, f);
     }
   }
@@ -1585,7 +2005,9 @@ export function makeHunks(ops, context = 3) {
 export function symbolSpan(lines, from, to) {
   let a = from - 1, b = to;
   while (a > 0 && /^\s*(?:@|\[[A-Z]|\/\/|\/\*\*|\*|#\[)/.test(lines[a - 1])) a--;
-  if (!lines[b]?.trim() && a > 0 && !lines[a - 1]?.trim()) b++;
+  // The blank lines after it go too; at the end of a block, the ones before.
+  if (b < lines.length - 1 && !lines[b].trim()) { while (b < lines.length - 1 && !lines[b].trim()) b++; }
+  else if (b >= lines.length - 1 || /^\s*[}\])]/.test(lines[b])) { while (a > 0 && !lines[a - 1].trim()) a--; }
   return [a, b];
 }
 
@@ -1729,6 +2151,544 @@ async function pruneDirs(dir, root) {
   }
 }
 
+// ───────────────────────────── Move fixes ─────────────────────────────
+// A mechanical move rewrites what it breaks, so "Move only" leaves the code
+// building. The rewrites are staged with the move:
+// - JS/TS and CSS: relative, `@/`, `~/`, and `/` specifiers in moved files and
+//   in the files that import them, each in its own form (with or without an
+//   extension, `.js` for a `.ts` file, a folder for its index file).
+// - Python: absolute and relative modules, `from pkg import module`, and
+//   `pkg.module.name` uses after `import pkg.module`.
+// - C#: a namespace that mirrors its folder follows the move; files that use
+//   the moved types get a `using`; qualified names follow.
+// Symbol moves also carry the moved code's imports to its new file, and the
+// old file imports it back (exporting it in JS/TS) when it still uses it.
+
+const SPEC_LANGS = new Set(['js', 'ts', 'vue', 'css']);
+const dirOfRel = (rel) => (!rel || posix.dirname(rel) === '.' ? '' : posix.dirname(rel));
+
+// Repo-relative path from a folder to a path ('.' for the folder itself).
+function relPath(fromDir, to) {
+  const a = fromDir ? fromDir.split('/') : [], b = to && to !== '.' ? to.split('/') : [];
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  return [...Array(a.length - i).fill('..'), ...b.slice(i)].join('/') || '.';
+}
+
+function spliceAll(text, edits) {
+  edits.sort((x, y) => y[0] - x[0]);
+  for (const [a, b, s] of edits) text = text.slice(0, a) + s + text.slice(b);
+  return text;
+}
+
+// The files of the staged view: disk, minus staged deletes, plus staged adds.
+function viewRels(space, repo) {
+  const rels = new Set(repo.facts.keys());
+  for (const it of space.stage.items.values()) if (it.repo === repo) { if (it.after == null) rels.delete(it.rel); else rels.add(it.rel); }
+  return rels;
+}
+
+function viewIndex(space) {
+  const recs = [];
+  for (const repo of space.repos) for (const rel of viewRels(space, repo)) recs.push({ repo, f: { rel, lang: langOf(rel), pkg: repo.facts.get(rel)?.pkg ?? null } });
+  return makeIndex(recs);
+}
+
+// The file an import names, read as if its file were at `rel`.
+function importTarget(repo, rel, imp, index) {
+  const hits = resolveImport({ repo, f: { rel, lang: langOf(rel) } }, imp, index);
+  return hits?.length === 1 && hits[0].repo === repo ? hits[0].f.rel : null;
+}
+
+// How a specifier named its file, as a function from a file's new path to
+// the path a new specifier names: exactly, without the extension, `.js` for
+// a `.ts` file, or the folder of an index file.
+function specForm(asked, target) {
+  if (asked === target) return (p) => p;
+  const tail = target.startsWith(asked) ? target.slice(asked.length) : null;
+  if (tail && (/^\.[^/]+$/.test(tail) || /^\/_?index\.[^/]+$/.test(tail))) return (p) => (p.endsWith(tail) ? p.slice(0, -tail.length) : p.replace(/\.[^./]+$/, ''));
+  const js = /\.[mc]?jsx?$/.exec(asked)?.[0];
+  if (js && target.startsWith(asked.slice(0, -js.length) + '.')) return (p) => p.replace(/\.[^./]+$/, '') + js;
+  return null;
+}
+
+// A specifier for a file at `fromNew` naming the file now at `targetNew`, in
+// the form the old specifier used; null when that form is unknown.
+function respec(spec, fromOld, targetOld, fromNew, targetNew) {
+  let base = dirOfRel(fromOld), rest = spec, prefix = null;
+  if (spec.startsWith('/')) { base = ''; rest = spec.slice(1); prefix = '/'; }
+  else if (/^[@~]\//.test(spec)) { rest = spec.slice(2); prefix = spec.slice(0, 2); base = targetOld.startsWith(posix.join('src', rest)) ? 'src' : ''; }
+  else if (!spec.startsWith('.')) return null;
+  const form = specForm(posix.normalize(posix.join(base || '.', rest)), targetOld);
+  if (!form) return null;
+  const want = form(targetNew);
+  if (prefix && !relPath(base, want).startsWith('..')) return prefix + relPath(base, want);
+  const r = relPath(dirOfRel(fromNew), want);
+  return r.startsWith('.') ? r : './' + r;
+}
+
+// The quoted specifier at or after an offset.
+function specAt(text, spec, from) {
+  let best = -1;
+  for (const q of `'"\``) { const i = text.indexOf(q + spec + q, from); if (i >= 0 && (best < 0 || i < best)) best = i; }
+  return best >= 0 && best - from < 4000 ? best + 1 : -1;
+}
+
+function fixSpecs(text, lang, repo, oldRel, newRel, map, index) {
+  const starts = lineStarts(text);
+  const edits = [];
+  for (const imp of readImports(text, maskCode(text, lang), lang)) {
+    if (!/^(?:\.|\/|[@~]\/)/.test(imp.spec)) continue;
+    const target = importTarget(repo, oldRel, imp, index);
+    if (!target) continue;
+    const targetNew = map.get(target) ?? target;
+    if (oldRel === newRel && target === targetNew) continue;
+    const next = respec(imp.spec, oldRel, target, newRel, targetNew);
+    const at = next && next !== imp.spec ? specAt(text, imp.spec, starts[imp.line - 1]) : -1;
+    if (at >= 0) edits.push([at, at + imp.spec.length, next]);
+  }
+  return spliceAll(text, edits);
+}
+
+// ── Python modules: `a/b/c` for a/b/c.py and a/b/c/__init__.py.
+
+const pyMod = (rel) => rel.replace(/\/__init__\.py$/, '').replace(/\.py$/, '');
+const pyFile = (rels, mod) => (rels.has(mod + '.py') ? mod + '.py' : rels.has(mod + '/__init__.py') ? mod + '/__init__.py' : null);
+const pyDots = (mod) => mod.split('/').join('.');
+
+function pyIndex(rels) {
+  const by = new Map();
+  for (const rel of rels) {
+    if (!rel.endsWith('.py')) continue;
+    const tail = pyMod(rel).split('/').pop();
+    if (!by.has(tail)) by.set(tail, []);
+    by.get(tail).push(rel);
+  }
+  return by;
+}
+
+// An absolute module path's folder root: the shortest one that holds it.
+function pyRoot(by, path1) {
+  let best = null;
+  for (const rel of by.get(path1.split('/').pop()) ?? []) {
+    const mod = pyMod(rel);
+    if (mod !== path1 && !mod.endsWith('/' + path1)) continue;
+    const root = mod.slice(0, mod.length - path1.length).replace(/\/$/, '');
+    if (best == null || root.length < best.length) best = root;
+  }
+  return best;
+}
+
+// A relative module spec from a folder: `.x`, `..a.b`, `..`.
+function pyRelSpec(fromDir, mod) {
+  const a = fromDir ? fromDir.split('/') : [], b = mod ? mod.split('/') : [];
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  return '.'.repeat(a.length - i + 1) + b.slice(i).join('.');
+}
+
+// A spec's module path from a file, and how to write a module path back in
+// the same style (relative from the file's new folder, or dotted from root).
+function pySpec(spec, fromRel, by, names = []) {
+  if (spec.startsWith('.')) {
+    const dots = /^\.+/.exec(spec)[0].length;
+    let base = dirOfRel(fromRel);
+    for (let i = 1; i < dots; i++) base = dirOfRel(base);
+    const rest = spec.slice(dots).split('.').filter(Boolean).join('/');
+    return { mod: [base, rest].filter(Boolean).join('/'), write: (mod, newRel) => pyRelSpec(dirOfRel(newRel), mod) };
+  }
+  const path1 = spec.split('.').join('/');
+  let root = pyRoot(by, path1);
+  for (const n of names) if (root == null) root = pyRoot(by, `${path1}/${n}`);
+  if (root == null) return null;
+  return { mod: [root, path1].filter(Boolean).join('/'), write: (mod) => pyDots(root && mod.startsWith(root + '/') ? mod.slice(root.length + 1) : mod) };
+}
+
+// Where a module path is after the moves: its file's new path, or a moved
+// folder's new path.
+function pyMoved(mod, rels, map) {
+  const f = pyFile(rels, mod);
+  if (f) return map.has(f) ? pyMod(map.get(f)) : mod;
+  for (const [a, b] of map) {
+    const tail = a.slice(mod.length);
+    if (a.startsWith(mod + '/') && b.endsWith(tail)) return b.slice(0, b.length - tail.length);
+  }
+  return mod;
+}
+
+// Rewrites a Python file's imports after file moves (`map`, old → new path)
+// and symbol moves (`syms`: [{ name, from: module, to: module }]).
+function fixPython(text, oldRel, newRel, map, rels, by, syms = []) {
+  const lines = text.split('\n');
+  const mlines = maskCode(text, 'py').split('\n');
+  const renames = [];
+  for (let i = 0; i < lines.length; i++) {
+    let m = /^(\s*)from\s+(\.*[\w.]*)\s+import\s+(.+)$/.exec(mlines[i]);
+    if (m && lines[i].startsWith(m[1] + 'from')) {
+      let end = i;
+      let items = lines[i].slice(lines[i].indexOf(' import ') + 8);
+      if (/^\s*\(/.test(items) && !items.includes(')')) { while (end + 1 < lines.length && !lines[end].includes(')')) items += ' ' + lines[++end].trim(); }
+      const list = items.replace(/[()\\]/g, ' ').split(',').map((s) => s.trim()).filter(Boolean).map((t) => ({ t, name: t.split(/\s+/)[0] }));
+      const at = pySpec(m[2], oldRel, by, list.map((x) => x.name));
+      if (!at) continue;
+      // Each name goes with its module: the spec's module where it is now, a
+      // moved submodule's new parent, or a moved symbol's new module.
+      const home = pyMoved(at.mod, rels, map);
+      const groups = new Map([[home, []]]);
+      for (const it of list) {
+        const sub = `${at.mod}/${it.name}`;
+        const sym = syms.find((s) => s.name === it.name && s.from === home);
+        const mod = sym ? sym.to : pyFile(rels, sub) ? dirOfRel(pyMoved(sub, rels, map)) : home;
+        if (!groups.has(mod)) groups.set(mod, []);
+        groups.get(mod).push(it.t);
+      }
+      if (!groups.get(home).length) groups.delete(home);
+      if (groups.size === 1 && groups.has(at.mod) && oldRel === newRel) continue;
+      const self = pyMod(newRel);
+      const out = [...groups].filter(([mod]) => mod !== self).map(([mod, ts]) => `${m[1]}from ${mod === at.mod && oldRel === newRel ? m[2] : at.write(mod, newRel)} import ${ts.join(', ')}`);
+      lines.splice(i, end - i + 1, ...out);
+      mlines.splice(i, end - i + 1, ...out);
+      i += out.length - 1;
+      continue;
+    }
+    m = /^(\s*)import\s+([\w., ]+?)\s*$/.exec(mlines[i]);
+    if (!m) continue;
+    const parts = lines[i].slice(lines[i].indexOf('import') + 6).split(',').map((p) => {
+      const [spec, , alias] = p.trim().split(/\s+/);
+      const at = pySpec(spec, oldRel, by);
+      if (!at) return p.trim();
+      const mod = pyMoved(at.mod, rels, map);
+      if (mod === at.mod) return p.trim();
+      const next = at.write(mod, newRel);
+      if (!alias) renames.push([spec, next]);
+      return alias ? `${next} as ${alias}` : next;
+    });
+    lines[i] = `${m[1]}import ${parts.join(', ')}`;
+  }
+  let out = lines.join('\n');
+  // `import a.b` binds `a.b.name` uses in code.
+  for (const [from, to] of renames) {
+    const masked = maskCode(out, 'py');
+    const edits = [];
+    const re = new RegExp(`(?<![\\w.])${from.replace(/\./g, '\\.')}(?=\\.\\w)`, 'g');
+    for (const hit of masked.matchAll(re)) if (!/^\s*import\b/.test(masked.slice(masked.lastIndexOf('\n', hit.index) + 1, hit.index))) edits.push([hit.index, hit.index + from.length, to]);
+    out = spliceAll(out, edits);
+  }
+  return out;
+}
+
+// ── C# namespaces.
+
+const csSpaces = (masked) => [...masked.matchAll(/\bnamespace\s+([A-Za-z_][\w.]*)\s*([{;])/g)].map((m) => ({ name: m[1], at: m.index + m[0].indexOf(m[1]), block: m[2] === '{' }));
+const csUsings = (masked) => new Set([...masked.matchAll(/^\s*(?:global\s+)?using\s+(?!static\b)(?![A-Za-z_]\w*\s*=)([A-Za-z_][\w.]*)\s*;/gm)].map((m) => m[1]));
+
+// The namespace a file gets in a new folder, when its namespace mirrors its
+// old folder (`App.Orders` in `Orders/`, or the root namespace in the folder
+// of a .csproj); null when it does not.
+function csNamespace(ns, fromRel, toRel, rels) {
+  const segs = ns.split('.');
+  const oldDir = dirOfRel(fromRel) ? dirOfRel(fromRel).split('/') : [];
+  const newDir = dirOfRel(toRel) ? dirOfRel(toRel).split('/') : [];
+  let k = 0;
+  while (k < segs.length - 1 && k < oldDir.length && segs.at(-1 - k).toLowerCase() === oldDir.at(-1 - k).toLowerCase()) k++;
+  const base = oldDir.slice(0, oldDir.length - k);
+  if (!k && ![...rels].some((r) => r.endsWith('.csproj') && dirOfRel(r) === base.join('/'))) return null;
+  if (base.some((s, i) => newDir[i] !== s)) return null;
+  const tail = newDir.slice(base.length);
+  if (tail.some((s) => !/^[A-Za-z_]\w*$/.test(s))) return null;
+  return [...segs.slice(0, segs.length - k), ...tail].join('.');
+}
+
+// Top-level types declared per namespace in a file.
+function csTypes(text, syms = readSymbols(text, maskCode(text, 'cs'), 'cs')) {
+  const out = [];
+  syms.forEach((s) => {
+    if (s.kind !== 'type') return;
+    let ns = '';
+    for (let p = s.up; p >= 0; p = syms[p].up) {
+      if (syms[p].kind === 'type') return;
+      if (syms[p].kind === 'space') { ns = syms[p].name + (ns ? '.' + ns : ''); }
+    }
+    out.push({ name: s.name, ns });
+  });
+  return out;
+}
+
+function addUsings(text, names) {
+  if (!names.length) return text;
+  const lines = text.split('\n');
+  let last = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^\s*(?:global\s+)?using\s+[\w.=\s]+;\s*$/.test(lines[i])) last = i;
+    else if (lines[i].trim() && !/^\s*(?:\/\/|#|\/\*|\*)/.test(lines[i])) break;
+  }
+  const add = names.map((n) => `using ${n};`);
+  if (last >= 0) lines.splice(last + 1, 0, ...add); else lines.splice(0, 0, ...add, '');
+  return lines.join('\n');
+}
+
+// Applies namespace shifts ({ rel, from, to, types }) across a repo's C# files:
+// qualified names follow the types; files that use them unqualified get a
+// `using` for the new namespace, and moved code gets one for the old.
+// Returns the paths it changed.
+function fixCsharp(space, repo, shifts, rels) {
+  const files = [...rels].filter((r) => langOf(r) === 'cs');
+  const texts = new Map(files.map((r) => [r, space.stage.read(`${repo.name}/${r}`)]));
+  const globals = new Set();
+  const declared = new Map();
+  const olds = shifts.map((s) => s.from);
+  for (const [r, text] of texts) {
+    if (text == null) continue;
+    if (text.includes('global using')) for (const m of maskCode(text, 'cs').matchAll(/^\s*global\s+using\s+(?!static\b)([A-Za-z_][\w.]*)\s*;/gm)) globals.add(m[1]);
+    // Types still declared in the old namespaces (files that name them).
+    if (!olds.some((ns) => text.includes(ns))) continue;
+    const cached = space.stage.items.has(`${repo.name}/${r}`) ? undefined : repo.facts.get(r)?.syms;
+    for (const t of csTypes(text, cached)) {
+      if (!declared.has(t.ns)) declared.set(t.ns, new Set());
+      declared.get(t.ns).add(t.name);
+    }
+  }
+  // Only files that name a moved type, or the moved files, can need a fix.
+  const names = [...new Set(shifts.flatMap((s) => s.types))];
+  const touched = [];
+  for (const [r, text] of texts) {
+    if (text == null || (!shifts.some((s) => s.rel === r) && !names.some((t) => text.includes(t)))) continue;
+    let out = text;
+    for (const s of shifts) {
+      const edits = [];
+      const masked = maskCode(out, 'cs');
+      for (const t of s.types) for (const m of masked.matchAll(new RegExp(`(?<![\\w.])${s.from.replace(/\./g, '\\.')}\\.${t}\\b`, 'g'))) edits.push([m.index, m.index + s.from.length, s.to]);
+      out = spliceAll(out, edits);
+    }
+    const masked = maskCode(out, 'cs');
+    const spaces = csSpaces(masked).map((x) => x.name);
+    const usings = csUsings(masked);
+    const sees = (ns) => !ns || globals.has(ns) || usings.has(ns) || spaces.some((n) => n === ns || n.startsWith(ns + '.'));
+    const own = new Set(csTypes(out).map((t) => t.name));
+    const uses = (names) => [...names].some((t) => !own.has(t) && new RegExp(`(?<![\\w.])${t}\\b`).test(masked));
+    const need = [];
+    for (const s of shifts) {
+      if (s.rel === r) {
+        const left = new Set([...(declared.get(s.from) ?? [])].filter((t) => !s.types.includes(t)));
+        if (left.size && uses(left) && !sees(s.from)) need.push(s.from);
+      } else if (uses(s.types) && !sees(s.to)) need.push(s.to);
+    }
+    out = addUsings(out, [...new Set(need)].filter((n) => !usings.has(n)));
+    if (out !== text) { space.stage.write(`${repo.name}/${r}`, out); touched.push(r); }
+  }
+  return touched;
+}
+
+// Fixes after file moves. `moves`: [{ repo, from, to }] (repo-relative paths);
+// `before`: the view index before the moves. Returns how many files other
+// than the moved ones it fixed.
+function fixMoves(space, moves, before) {
+  const touched = new Set();
+  for (const repo of new Set(moves.map((m) => m.repo))) {
+    const map = new Map(moves.filter((m) => m.repo === repo).map((m) => [m.from, m.to]));
+    const back = new Map([...map].map(([a, b]) => [b, a]));
+    const relsBefore = new Set([...viewRels(space, repo)].map((r) => back.get(r) ?? r));
+    const relsAfter = viewRels(space, repo);
+    const by = pyIndex(relsBefore);
+    const hints = new Set();
+    for (const [from] of map) { hints.add(posix.basename(from).replace(/\.[^.]+$/, '')); hints.add(posix.basename(dirOfRel(from)) || '\0'); }
+    for (const rel of relsAfter) {
+      const lang = langOf(rel);
+      if (!SPEC_LANGS.has(lang) && lang !== 'py') continue;
+      const key = `${repo.name}/${rel}`;
+      const text = space.stage.read(key);
+      if (text == null) continue;
+      const oldRel = back.get(rel) ?? rel;
+      if (oldRel === rel && ![...hints].some((h) => text.includes(h))) continue;
+      const out = lang === 'py' ? fixPython(text, oldRel, rel, map, relsBefore, by) : fixSpecs(text, lang, repo, oldRel, rel, map, before);
+      if (out !== text) { space.stage.write(key, out); if (oldRel === rel) touched.add(key); }
+    }
+    const shifts = [];
+    for (const [from, to] of map) {
+      if (langOf(to) !== 'cs') continue;
+      const key = `${repo.name}/${to}`;
+      const text = space.stage.read(key);
+      const ns = text != null && csSpaces(maskCode(text, 'cs'))[0];
+      const next = ns && csNamespace(ns.name, from, to, relsBefore);
+      if (!next || next === ns.name) continue;
+      space.stage.write(key, text.slice(0, ns.at) + next + text.slice(ns.at + ns.name.length));
+      shifts.push({ rel: to, from: ns.name, to: next, types: csTypes(text).filter((t) => t.ns === ns.name).map((t) => t.name) });
+    }
+    for (const r of shifts.length ? fixCsharp(space, repo, shifts, relsAfter) : []) if (!back.has(r)) touched.add(`${repo.name}/${r}`);
+  }
+  return touched.size;
+}
+
+// ── Symbol moves.
+
+// JS/TS import and re-export statements with bindings.
+const JS_STMT_RE = /^[ \t]*(import|export)\s+(type\s+)?(?:([A-Za-z_$][\w$]*)\s*,?\s*)?(?:\*\s+as\s+([A-Za-z_$][\w$]*)\s*)?(?:\{([^}]*)\}\s*)?from\s*(['"])([^'"\n]+)\6[ \t]*;?[ \t]*(?:\n|$)/gm;
+
+function jsStatements(text) {
+  const masked = maskCode(text, 'ts');
+  const out = [];
+  for (const m of text.matchAll(JS_STMT_RE)) {
+    const at = m.index + m[0].search(/\S/);
+    if (masked[at] !== text[at]) continue;
+    const named = (m[5] ?? '').split(',').map((s) => s.trim()).filter(Boolean).map((t) => {
+      const [name, bind = name] = t.replace(/^type\s+/, '').split(/\s+as\s+/).map((x) => x.trim());
+      return { t, name, bind };
+    });
+    out.push({ start: m.index, end: m.index + m[0].length, kind: m[1], type: !!m[2], def: m[3] ?? null, ns: m[4] ?? null, named, q: m[6], spec: m[7], nl: m[0].endsWith('\n') });
+  }
+  return out;
+}
+
+function jsRender(s) {
+  const parts = [s.def, s.ns && `* as ${s.ns}`, s.named.length ? `{ ${s.named.map((n) => n.t).join(', ')} }` : null].filter(Boolean);
+  return parts.length ? `${s.kind} ${s.type ? 'type ' : ''}${parts.join(', ')} from ${s.q}${s.spec}${s.q};${s.nl ? '\n' : ''}` : '';
+}
+
+// Puts statements after a file's leading imports, or first with a blank line.
+function addImports(text, add, lang) {
+  if (!add.length) return text;
+  const lines = text.split('\n');
+  const py = lang === 'py';
+  let last = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (py ? /^(?:import|from)\s/.test(l) : /^\s*import\b|^\s*export\s+(?:type\s+)?[{*][^;]*\bfrom\b/.test(l)) {
+      last = i;
+      if (!py) while (last < lines.length - 1 && !/['"`]\s*;?\s*$/.test(lines[last])) last++;
+      i = last;
+    } else if (l.trim() && !/^\s*(?:\/\/|#|\/\*|\*|['"]use )/.test(l)) break;
+  }
+  if (last >= 0) lines.splice(last + 1, 0, ...add); else lines.splice(0, 0, ...add, '');
+  return lines.join('\n');
+}
+
+const codeWords = (code, lang) => new Set(maskCode(code, lang).match(/[A-Za-z_$][\w$]*/g) ?? []);
+
+// Top-level names a JS/TS or Python file declares, with the line of each.
+function topNames(text, lang) {
+  const re = lang === 'py'
+    ? /^(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)|^([A-Za-z_]\w*)\s*(?::[^=\n]*)?=(?!=)/gm
+    : /^(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:function\*?|class|interface|type|enum|const|let|var)\s+([A-Za-z_$][\w$]*)/gm;
+  const starts = lineStarts(text);
+  const out = new Map();
+  for (const m of maskCode(text, lang).matchAll(re)) out.set(m[1] ?? m[2], lineAt(starts, m.index));
+  return out;
+}
+
+const jsSpecTo = (from, to) => { const r = relPath(dirOfRel(from), to.replace(/\.[^./]+$/, '')); return r.startsWith('.') ? r : './' + r; };
+const pyPackaged = (rels, rel) => rels.has(posix.join(dirOfRel(rel), '__init__.py'));
+const pySpecTo = (rels, from, to) => (pyPackaged(rels, from) && pyPackaged(rels, to) ? pyRelSpec(dirOfRel(from), pyMod(to)) : pyDots(pyMod(to)));
+
+// What a moved symbol takes along: the imports its code uses (respecified
+// for the new file) and the old file's names it uses (exported there and
+// imported back); and the old file imports the symbol when it still uses it.
+// Returns { rest, cut, add }: old file text, moved lines, imports for the new file.
+function symbolImports(space, repo, name, fromRel, toRel, rest, cut, index) {
+  const lang = langOf(fromRel);
+  const used = codeWords(cut.join('\n'), lang);
+  const add = [];
+  const tops = topNames(rest, lang);
+  const back = [...tops.keys()].filter((n) => n !== name && used.has(n));
+  const lines = rest.split('\n');
+  if (lang === 'py') {
+    const rels = viewRels(space, repo);
+    const by = pyIndex(rels);
+    for (const l of lines) {
+      let m = /^from\s+(\.*[\w.]*)\s+import\s+([^()\\]+)$/.exec(l);
+      if (m) {
+        const items = m[2].split(',').map((s) => s.trim()).filter((t) => used.has(t.split(/\s+/).pop()));
+        const at = items.length && pySpec(m[1], fromRel, by, items.map((t) => t.split(/\s+/)[0]));
+        if (items.length && (!at || at.mod !== pyMod(toRel))) add.push(`from ${at && m[1].startsWith('.') ? at.write(at.mod, toRel) : m[1]} import ${items.join(', ')}`);
+        continue;
+      }
+      m = /^import\s+([\w., ]+)$/.exec(l);
+      const items = m ? m[1].split(',').map((s) => s.trim()).filter((t) => used.has(t.split(/\s+/).pop().split('.')[0])) : [];
+      if (items.length) add.push(`import ${items.join(', ')}`);
+    }
+    if (back.length) add.push(`from ${pySpecTo(rels, toRel, fromRel)} import ${back.join(', ')}`);
+    if (codeWords(rest, lang).has(name)) rest = addImports(rest, [`from ${pySpecTo(rels, fromRel, toRel)} import ${name}`], lang);
+    return { rest, cut, add };
+  }
+  for (const s of jsStatements(rest)) {
+    if (s.kind !== 'import') continue;
+    const keep = { ...s, def: s.def && used.has(s.def) ? s.def : null, ns: s.ns && used.has(s.ns) ? s.ns : null, named: s.named.filter((n) => used.has(n.bind)), nl: false };
+    if (!keep.def && !keep.ns && !keep.named.length) continue;
+    const target = /^(?:\.|\/|[@~]\/)/.test(s.spec) ? importTarget(repo, fromRel, { spec: s.spec }, index) : null;
+    if (target === toRel) continue;
+    if (target) keep.spec = respec(s.spec, fromRel, target, toRel, target) ?? s.spec;
+    add.push(jsRender(keep));
+  }
+  if (back.length) add.push(`import { ${back.join(', ')} } from '${jsSpecTo(toRel, fromRel)}';`);
+  for (const n of back) { const l = tops.get(n) - 1; if (!/^\s*export\b/.test(lines[l])) lines[l] = 'export ' + lines[l]; }
+  rest = lines.join('\n');
+  if (codeWords(rest, lang).has(name)) {
+    rest = addImports(rest, [`import { ${name} } from '${jsSpecTo(fromRel, toRel)}';`], lang);
+    const decl = cut.findIndex((l) => /^(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:function\*?|class|interface|type|enum|const|let|var)\s/.test(l));
+    if (decl >= 0) cut = cut.map((l, i) => (i === decl ? 'export ' + l : l));
+  }
+  return { rest, cut, add };
+}
+
+// Files that import the symbol by name from its old file import it from the
+// new one; the new file drops its own import of it. Returns the new file's text.
+function symbolUsers(space, repo, name, fromRel, toRel, dest, index) {
+  const lang = langOf(fromRel);
+  const rels = viewRels(space, repo);
+  const by = lang === 'py' ? pyIndex(rels) : null;
+  const syms = [{ name, from: pyMod(fromRel), to: pyMod(toRel) }];
+  for (const rel of rels) {
+    if (rel === fromRel || (lang === 'py' ? langOf(rel) !== 'py' : !['js', 'ts', 'vue'].includes(langOf(rel)))) continue;
+    const key = `${repo.name}/${rel}`;
+    const text = rel === toRel ? dest : space.stage.read(key);
+    if (text == null || !text.includes(name)) continue;
+    let out = text;
+    if (lang === 'py') out = fixPython(text, rel, rel, new Map(), rels, by, syms);
+    else {
+      const edits = [];
+      for (const s of jsStatements(text)) {
+        const hit = s.named.find((n) => n.name === name);
+        if (!hit || importTarget(repo, rel, { spec: s.spec }, index) !== fromRel) continue;
+        let next = jsRender({ ...s, named: s.named.filter((n) => n !== hit) });
+        if (rel !== toRel) next += jsRender({ ...s, def: null, ns: null, named: [hit], spec: respec(s.spec, rel, fromRel, rel, toRel) ?? jsSpecTo(rel, toRel) });
+        edits.push([s.start, s.end, next]);
+      }
+      out = spliceAll(text, edits);
+    }
+    if (out === text) continue;
+    if (rel === toRel) dest = out; else space.stage.write(key, out);
+  }
+  return dest;
+}
+
+// Puts moved lines into a file: inside a C# block namespace (reindented to
+// its members), else at the end after a blank line (two between top-level
+// Python definitions).
+function placeSymbol(dest, cut, lang) {
+  const indentOf = (l) => l.length - l.trimStart().length;
+  if (lang === 'cs') {
+    const masked = maskCode(dest, 'cs');
+    const block = csSpaces(masked).find((s) => s.block);
+    const open = block ? masked.indexOf('{', block.at) : -1;
+    const close = open >= 0 ? pairMap(masked)[open] : -1;
+    if (close > 0) {
+      const inner = dest.slice(open + 1, close);
+      const indent = /^([ \t]*)\S/m.exec(inner)?.[1] ?? '    ';
+      const from = Math.min(...cut.filter((l) => l.trim()).map(indentOf));
+      const body = cut.map((l) => (l.trim() ? indent + l.slice(from) : ''));
+      const lines = dest.split('\n');
+      const at = lineAt(lineStarts(dest), close) - 1;
+      let k = at;
+      while (k > 0 && !lines[k - 1].trim()) k--;
+      lines.splice(k, at - k, ...(inner.trim() ? [''] : []), ...body);
+      return lines.join('\n');
+    }
+  }
+  const body = dest.replace(/\s+$/, '');
+  const gap = lang === 'py' && !indentOf(cut.find((l) => l.trim()) ?? '') ? '\n\n\n' : '\n\n';
+  return (body ? body + gap : '') + cut.join('\n') + '\n';
+}
+
+
 // ───────────────────────────── Scanning ─────────────────────────────
 
 function run(cmd, args, cwd) {
@@ -1741,24 +2701,97 @@ async function isGit(root) {
   return (await run('git', ['rev-parse', '--is-inside-work-tree'], root))?.trim() === 'true';
 }
 
-export async function listFiles(root) {
+// Files to scan, relative to root. In git: tracked files minus cache folders,
+// plus untracked files that are not ignored, minus cache and build folders.
+// Outside git: a walk that skips both and honors every .gitignore on the way.
+// `stats` counts what each rule skipped.
+export async function listFiles(root, stats = {}) {
+  stats.cache = stats.build = stats.ignored = 0;
+  const under = (r, test) => { const parts = r.split('/'); for (let i = 0; i < parts.length - 1; i++) if (test(parts[i])) return true; return false; };
   if (await isGit(root)) {
-    const out = await run('git', ['ls-files', '-z', '-c', '-o', '--exclude-standard'], root);
-    if (out != null) return [...new Set(out.split('\0').filter(Boolean))].filter((r) => !r.split('/').some((p) => p === '.git' || p === 'node_modules')).slice(0, MAX_FILES);
+    const excludes = [...CACHE_DIRS, ...BUILD_DIRS, '*.egg-info'].map((d) => `--exclude=${d}/`);
+    const tracked = await run('git', ['ls-files', '-z', '-c'], root);
+    const loose = await run('git', ['ls-files', '-z', '-o', '--exclude-standard', ...excludes], root);
+    if (tracked != null && loose != null) {
+      const out = new Set();
+      for (const r of tracked.split('\0')) if (r) { if (under(r, isCacheDir)) stats.cache++; else out.add(r); }
+      for (const r of loose.split('\0')) if (r) { if (under(r, isSkipDir)) stats.build++; else out.add(r); }
+      return [...out].slice(0, MAX_FILES);
+    }
   }
   const out = [];
-  const walk = async (rel) => {
+  const walk = async (rel, rules) => {
     let entries;
     try { entries = await fsp.readdir(path.join(root, rel), { withFileTypes: true }); } catch { return; }
+    if (entries.some((e) => e.name === '.gitignore' && e.isFile())) {
+      const own = readIgnore((await readMaybe(path.join(root, rel, '.gitignore'))) ?? '');
+      if (own.length) rules = [...rules, { base: rel, rules: own }];
+    }
     for (const e of entries) {
       if (out.length >= MAX_FILES) return;
-      if (e.name.startsWith('.') && e.name !== '.github' && e.name !== '.env.example' && e.isDirectory()) continue;
+      const dir = e.isDirectory();
+      if (dir && e.name.startsWith('.') && e.name !== '.github' && !isCacheDir(e.name)) continue;
+      if (dir && isSkipDir(e.name)) { stats[isCacheDir(e.name) ? 'cache' : 'build']++; continue; }
       const r = rel ? `${rel}/${e.name}` : e.name;
-      if (e.isDirectory()) { if (!SKIP_DIRS.has(e.name)) await walk(r); }
+      if (rules.length && isIgnored(rules, r, dir)) { stats.ignored++; continue; }
+      if (dir) await walk(r, rules);
       else if (e.isFile()) out.push(r);
     }
   };
-  await walk('');
+  await walk('', []);
+  return out;
+}
+
+// .gitignore lines as rules: { neg, dir, re }. A slash at the start or in the
+// middle anchors a pattern to its file's folder; otherwise it matches at any
+// depth. A trailing slash matches folders only.
+export function readIgnore(text) {
+  const rules = [];
+  for (let line of text.split(/\r?\n/)) {
+    line = line.replace(/(?<!\\)\s+$/, '');
+    if (!line || line.startsWith('#')) continue;
+    const neg = line.startsWith('!');
+    if (neg || line.startsWith('\\!') || line.startsWith('\\#')) line = line.slice(1);
+    const dir = line.endsWith('/');
+    if (dir) line = line.replace(/\/+$/, '');
+    const anchored = line.includes('/');
+    line = line.replace(/^\//, '');
+    if (!line) continue;
+    rules.push({ neg, dir, re: new RegExp(`^${anchored ? '' : '(?:.*/)?'}${globSource(line)}$`) });
+  }
+  return rules;
+}
+
+function globSource(glob) {
+  let s = '';
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === '*' && glob[i + 1] === '*') {
+      const lead = i === 0 || glob[i - 1] === '/', tail = i + 2 === glob.length || glob[i + 2] === '/';
+      if (lead && tail) { s += i + 2 === glob.length ? '.*' : '(?:.*/)?'; i += 2; continue; }
+      s += '[^/]*'; i++; continue;
+    }
+    if (c === '*') s += '[^/]*';
+    else if (c === '?') s += '[^/]';
+    else if (c === '[') {
+      const end = glob.indexOf(']', i + 2);
+      if (end < 0) { s += '\\['; continue; }
+      s += '[' + glob.slice(i + 1, end).replace(/^!/, '^').replace(/\\/g, '\\\\') + ']';
+      i = end;
+    } else if (c === '\\' && i + 1 < glob.length) s += '\\' + glob[++i];
+    else s += /[.+^${}()|\\]/.test(c) ? '\\' + c : c;
+  }
+  return s;
+}
+
+// The last matching rule wins; deeper .gitignore files come later in `stack`.
+export function isIgnored(stack, rel, dir) {
+  let out = false;
+  for (const { base, rules } of stack) {
+    if (base && !rel.startsWith(base + '/')) continue;
+    const p = base ? rel.slice(base.length + 1) : rel;
+    for (const r of rules) if ((!r.dir || dir) && r.re.test(p)) out = !r.neg;
+  }
   return out;
 }
 
@@ -1818,8 +2851,15 @@ async function pool(list, size, fn) {
   }));
 }
 
-export async function scanRepo(repo, onStep) {
-  const rels = await listFiles(repo.root);
+// `trees` (core_tree.mjs) parses the languages whose grammars load; facts
+// read by the other parser are read again.
+export async function scanRepo(repo, onStep, { trees = null } = {}) {
+  const t0 = performance.now();
+  const stats = {};
+  const rels = await listFiles(repo.root, stats);
+  const tree = trees?.ready ? await trees.load(new Set(rels.map(langOf))) : new Set();
+  const treeMs = { ...trees?.stats.ms };
+  repo.trees = tree.size ? trees : null;
   const seen = new Set();
   let done = 0;
   const total = rels.length;
@@ -1831,11 +2871,12 @@ export async function scanRepo(repo, onStep) {
     done++;
     if (done % 100 === 0) onStep?.({ repo: repo.name, done, total });
     const old = repo.facts.get(rel);
-    if (old && old.mtime === st.mtimeMs && old.bytes === st.size) { seen.add(rel); return; }
+    const parser = tree.has(langOf(rel)) ? 'tree' : undefined;
+    if (old && old.mtime === st.mtimeMs && old.bytes === st.size && (old.parser === parser || old.gen)) { seen.add(rel); return; }
     if (repo.skip.get(rel) === st.mtimeMs) return;
     if (st.size > MAX_BYTES) {
       seen.add(rel);
-      repo.facts.set(rel, { rel, lang: langOf(rel), lines: Math.round(st.size / 40), gen: true, syms: [], imports: [], words: new Map(), marks: [], copy: null, mtime: st.mtimeMs, bytes: st.size, hash: '' });
+      repo.facts.set(rel, { rel, lang: langOf(rel), lines: Math.round(st.size / 40), gen: true, syms: [], imports: [], words: new Map(), vars: [], refs: [], marks: [], copy: null, mtime: st.mtimeMs, bytes: st.size, hash: '' });
       return;
     }
     let buf;
@@ -1844,19 +2885,32 @@ export async function scanRepo(repo, onStep) {
     seen.add(rel);
     const text = buf.toString('utf8');
     repo.texts.set(rel, text);
-    const f = readFacts(rel, text);
+    const f = readFacts(rel, text, { trees: parser ? trees : null });
     f.mtime = st.mtimeMs;
     f.bytes = st.size;
     repo.facts.set(rel, f);
   });
   for (const rel of [...repo.facts.keys()]) if (!seen.has(rel)) { repo.facts.delete(rel); repo.texts.delete(rel); }
   repo.git = await readGit(repo.root);
+  stats.files = repo.facts.size;
+  stats.ms = Math.round(performance.now() - t0);
+  stats.tree = Object.fromEntries([...tree].map((l) => [l, Math.round((trees.stats.ms[l] ?? 0) - (treeMs[l] ?? 0))]));
+  repo.stats = stats;
   onStep?.({ repo: repo.name, done: total, total });
+}
+
+// One line per scan on stderr when DEVIBE_DEBUG is set.
+function logScan(repo) {
+  if (!process.env.DEVIBE_DEBUG) return;
+  const s = repo.stats ?? {};
+  const tree = Object.entries(s.tree ?? {}).map(([l, ms]) => `${l} ${ms} ms`).join(', ');
+  process.stderr.write(`[devibe] scan ${repo.name}: ${s.files} files in ${s.ms} ms; skipped ${s.cache} in cache folders, ${s.build} in build folders, ${s.ignored} by .gitignore${tree ? `; tree-sitter: ${tree}` : ''}\n`);
 }
 
 // ───────────────────────────── Config and ledger ─────────────────────────────
 
-export const DEFAULTS = { endpoint: 'https://openrouter.ai/api/v1', model: 'deepseek/deepseek-v4.1-flash', apiKey: '', style: '', maxTurns: 40, recent: [] };
+export const DEFAULTS = { endpoint: 'https://openrouter.ai/api/v1', model: 'deepseek/deepseek-v4.1-flash', apiKey: '', style: '', maxTurns: 40, parser: 'built-in', recent: [] };
+export const PARSERS = ['built-in', 'tree-sitter'];
 
 export function homeDir() { return process.env.DEVIBE_HOME || path.join(os.homedir(), '.devibe'); }
 
@@ -1869,6 +2923,7 @@ export function loadConfig(home = homeDir()) {
     endpoint: env.DEVIBE_ENDPOINT || saved.endpoint || DEFAULTS.endpoint,
     model: env.DEVIBE_MODEL || saved.model || DEFAULTS.model,
     apiKey: env.DEVIBE_API_KEY || saved.apiKey || env.OPENROUTER_API_KEY || env.OPENAI_API_KEY || '',
+    parser: [env.DEVIBE_PARSER, saved.parser].find((x) => PARSERS.includes(x)) ?? DEFAULTS.parser,
   };
 }
 
@@ -1908,6 +2963,7 @@ export class Workspace {
     this.agent = { busy: false, history: [], abort: null };
     this.timers = new Map();
     this.quiet = 0;
+    this.trees = null;
   }
   on(fn) { this.subs.add(fn); return () => this.subs.delete(fn); }
   emit(type, data) { for (const fn of this.subs) fn(type, data); }
@@ -1938,9 +2994,17 @@ export class Workspace {
     this.build();
   }
 
+  // The Tree-sitter reader, made on first use when the parser setting asks for it.
+  treesFor() {
+    if (this.config.parser !== 'tree-sitter') return null;
+    this.trees ??= makeTrees();
+    return this.trees;
+  }
+
   async scan(list = this.repos) {
     for (const repo of list) {
-      await scanRepo(repo, (step) => this.emit('scan.step', step));
+      await scanRepo(repo, (step) => this.emit('scan.step', step), { trees: this.treesFor() });
+      logScan(repo);
       if (this.watching) this.watch(repo);
     }
     this.build();
@@ -2097,14 +3161,19 @@ export class Workspace {
     const files = node.kind === 'file' ? [node] : this.model.nodes.filter((n) => n.kind === 'file' && n.key.startsWith(node.key + '/'));
     if (!files.length) throw new Error('Nothing to move.');
     const baseDir = node.kind === 'file' ? posix.dirname(node.path) : posix.dirname(node.path);
+    const before = viewIndex(this);
     const moved = [];
+    const moves = [];
     for (const f of files) {
       const tail = posix.relative(baseDir === '.' ? '' : baseDir, f.path);
-      const to = `${toRepo.name}/${posix.join(target.path ?? '', tail)}`;
+      const rel = posix.join(target.path ?? '', tail);
+      const to = `${toRepo.name}/${rel}`;
       if (to === f.key) continue;
       this.stage.move(`${fromRepo.name}/${f.path}`, to);
       moved.push(to);
+      if (toRepo === fromRepo) moves.push({ repo: fromRepo, from: f.path, to: rel });
     }
+    moved.fixed = fixMoves(this, moves, before);
     return moved;
   }
 
@@ -2149,14 +3218,32 @@ export class Workspace {
     const text = this.stage.read(from);
     const dest = this.stage.read(target.key);
     if (text == null || dest == null) throw new Error('That file is gone or staged for delete.');
+    const index = viewIndex(this);
     const lines = text.split('\n');
     const [a, b] = symbolSpan(lines, node.from, node.to);
-    const cut = lines.slice(a, b);
+    let cut = lines.slice(a, b);
     while (cut.length && !cut.at(-1).trim()) cut.pop();
+    while (cut.length && !cut[0].trim()) cut.shift();
     lines.splice(a, b - a);
-    this.stage.write(from, lines.join('\n'));
-    const body = dest.replace(/\s+$/, '');
-    this.stage.write(target.key, (body ? body + '\n\n' : '') + cut.join('\n') + '\n');
+    let rest = lines.join('\n');
+    const src = this.locate(from), dst = this.locate(target.key);
+    const lang = langOf(src.rel), toLang = langOf(dst.rel);
+    const name = node.name.split('::').pop();
+    // Top-level JS/TS and Python symbols take their imports along.
+    const js = (l) => l === 'js' || l === 'ts' || l === 'vue';
+    const fixes = src.repo === dst.repo && ((js(lang) && js(toLang)) || (lang === 'py' && toLang === 'py')) && !/^\s/.test(cut.find((l) => l.trim()) ?? ' ');
+    let add = [];
+    if (fixes) ({ rest, cut, add } = symbolImports(this, src.repo, name, src.rel, dst.rel, rest, cut, index));
+    this.stage.write(from, rest);
+    this.stage.write(target.key, addImports(placeSymbol(dest, cut, lang), add, lang));
+    if (fixes) this.stage.write(target.key, symbolUsers(this, src.repo, name, src.rel, dst.rel, this.stage.read(target.key), index));
+    // A C# type that changes namespace: usings and qualified names follow it.
+    if (lang === 'cs' && toLang === 'cs' && node.kind === 'type' && src.repo === dst.repo) {
+      const spaces = [];
+      for (let p = node.up; p >= 0 && this.model.nodes[p].kind !== 'file'; p = this.model.nodes[p].up) if (this.model.nodes[p].kind === 'space') spaces.unshift(this.model.nodes[p].name);
+      const was = spaces.join('.'), now = csSpaces(maskCode(this.stage.read(target.key), 'cs'))[0]?.name ?? '';
+      if (was !== now) fixCsharp(this, src.repo, [{ rel: dst.rel, from: was, to: now, types: [name] }], viewRels(this, src.repo));
+    }
     return { from, to: target.key, name: node.name };
   }
 
@@ -2262,14 +3349,19 @@ export class Workspace {
     this.build();
   }
 
+  // Returns true when the parser changed: the repos need a rescan.
   setConfig(patch) {
     for (const k of ['endpoint', 'model', 'apiKey', 'style', 'maxTurns']) if (patch[k] !== undefined) this.config[k] = k === 'maxTurns' ? Math.max(1, Math.min(200, +patch[k] || 40)) : String(patch[k]);
+    const reparse = PARSERS.includes(patch.parser) && patch.parser !== this.config.parser;
+    if (reparse) this.config.parser = patch.parser;
     this.saveConfig();
+    return reparse;
   }
   saveConfig() { try { saveConfig(this.config, this.home); } catch { /* read-only home */ } }
   configState() {
-    const { endpoint, model, style, maxTurns, recent } = this.config;
-    return { endpoint, model, style, maxTurns, recent, hasKey: !!this.config.apiKey, repos: this.repos.map((r) => ({ name: r.name, root: r.root })) };
+    const { endpoint, model, style, maxTurns, parser, recent } = this.config;
+    const trees = { ready: (this.trees ?? makeTrees()).ready, langs: Object.keys(GRAMMARS).map((id) => LANG[id].name) };
+    return { endpoint, model, style, maxTurns, parser, trees, recent, hasKey: !!this.config.apiKey, repos: this.repos.map((r) => ({ name: r.name, root: r.root })) };
   }
 }
 
@@ -2759,6 +3851,7 @@ const STATIC = {
   '/core_sets.mjs': ['core_sets.mjs', 'text/javascript'],
   '/core_city.mjs': ['core_city.mjs', 'text/javascript'],
   '/core_force.mjs': ['core_force.mjs', 'text/javascript'],
+  '/core_route.mjs': ['core_route.mjs', 'text/javascript'],
   '/lib/d3.js': ['node_modules/d3/dist/d3.min.js', 'text/javascript'],
 };
 const LIB_DIRS = [['/lib/three/addons/', 'node_modules/three/examples/jsm/'], ['/lib/three/', 'node_modules/three/build/']];
@@ -2813,7 +3906,7 @@ async function listDir(dir) {
   try { entries = await fsp.readdir(abs, { withFileTypes: true }); } catch (e) { throw new Error(`Cannot read ${abs}`); }
   const items = [];
   for (const e of entries) {
-    if (!e.isDirectory() || e.name.startsWith('.') || SKIP_DIRS.has(e.name)) continue;
+    if (!e.isDirectory() || e.name.startsWith('.') || isSkipDir(e.name)) continue;
     const full = path.join(abs, e.name);
     items.push({ name: e.name, path: full, repo: fs.existsSync(path.join(full, '.git')) });
   }
@@ -2857,7 +3950,8 @@ function handlers(space) {
       }
       const moved = space.moveFile(key, to);
       space.build();
-      return { type: 'note', data: { level: 'good', text: `Staged move of ${moved.length} file${moved.length === 1 ? '' : 's'}.` } };
+      const fixed = moved.fixed ? `, with imports fixed in ${moved.fixed} other file${moved.fixed === 1 ? '' : 's'}` : '';
+      return { type: 'note', data: { level: 'good', text: `Staged move of ${moved.length} file${moved.length === 1 ? '' : 's'}${fixed}.` } };
     },
     'stage.edit': ({ key, from, to, text }) => { const k = space.stage.editRange(key, from, to, text ?? ''); space.build(); return { type: 'note', data: { level: 'good', text: `Staged edit to ${k}.` } }; },
     'stage.hunk': ({ key, index: i }) => { const k = space.stage.revertHunk(key, i); space.build(); return { type: 'note', data: { level: 'good', text: `Reverted a change in ${k}.` } }; },
@@ -2867,7 +3961,7 @@ function handlers(space) {
     'stage.preview': ({ on }) => { space.setPreview(on); return null; },
     'review.mark': ({ keys, on }) => { space.mark(keys, on); return null; },
     'issue.waive': ({ rule, key, on }) => { space.waive(rule, key, on); return null; },
-    'config.set': (patch) => { space.setConfig(patch); return { type: 'config.state', data: space.configState() }; },
+    'config.set': async (patch) => { if (space.setConfig(patch)) await space.scan(); return { type: 'config.state', data: space.configState() }; },
   };
 }
 

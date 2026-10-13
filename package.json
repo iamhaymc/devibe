@@ -9,8 +9,8 @@
   },
   "scripts": {
     "start": "node app/server.mjs",
-    "test": "node --test test/server.test.mjs test/sets.test.mjs test/client.test.mjs",
-    "test:server": "node --test test/server.test.mjs test/sets.test.mjs",
+    "test": "node --test test/server.test.mjs test/sets.test.mjs test/route.test.mjs test/tree.test.mjs test/client.test.mjs",
+    "test:server": "node --test test/server.test.mjs test/sets.test.mjs test/route.test.mjs test/tree.test.mjs",
     "test:client": "node --test test/client.test.mjs"
   },
   "engines": {
@@ -25,5 +25,8 @@
   },
   "devDependencies": {
     "playwright": "^1.56.1"
+  },
+  "optionalDependencies": {
+    "@vscode/tree-sitter-wasm": "^0.3.1"
   }
 }

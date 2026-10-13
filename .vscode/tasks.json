@@ -25,6 +25,38 @@
         "clear": true
       },
       "problemMatcher": []
+    },
+    {
+      "label": "serve",
+      "type": "shell",
+      "command": "node app/server.mjs ${input:serveArgs} --open",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "isBackground": true,
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": {
+        "owner": "devibe",
+        "pattern": {
+          "regexp": "a^"
+        },
+        "background": {
+          "activeBegin": "^devibe is running at ",
+          "activeEnd": "^devibe is running at "
+        }
+      }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "serveArgs",
+      "type": "promptString",
+      "description": "Folders to serve (space-separated), or --demo",
+      "default": "--demo"
     }
   ]
 }

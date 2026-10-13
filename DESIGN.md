@@ -40,7 +40,7 @@ devibe helps you understand, audit, and reshape codebases that grew faster than 
 │  ├─ Canvas 2D "ink": labels, code, outlines  │        │  Ledger (reviews, waivers, sets)  │
 │  ├─ d3: layouts, zoom, scales, transitions   │        │  Agent (acts, tools, set prompts) │
 │  ├─ core_sets.mjs: index, grow, queries      │        │  core_sets.mjs (the same module)  │
-│  └─ DOM: bar, Check, Change, Selection, Act  │        │                                   │
+│  └─ DOM: bar, Check, Change, Selection, Act  │        │  core_tree.mjs (optional parser)  │
 └──────────────────────────────────────────────┘        └───────────────────────────────────┘
 ```
 
@@ -54,13 +54,17 @@ Files (source in `app/`, tests and screenshots in `test/`):
 | `app/client.css` | Theme tokens (dark, light, system), layout, panels, responsive rules. |
 | `app/client.mjs` | Hub, state, wire, Map, Graph, Layers, tile renderer, 2D ink, picking, panels, Act bar, Code sheet, keys. |
 | `app/core_force.mjs` | The Graph force layout. Runs in place for small graphs and as a module worker (`core_force.mjs?worker`) for large ones. |
+| `app/core_route.mjs` | Link routes for Graph, Layers, and Map, with no DOM, d3, or three.js: arcs cut at circle edges; box-edge to box-edge curves (Layers ends fan out toward the other box); Map curves that leave and arrive at right angles, gutter brackets between lines of one code column, level trunks from a code line to its file's edge, and bundles that cross folder borders where the folders face each other. |
 | `app/core_city.mjs` | City: box shader, open-building planner, skyline index (picking and occlusion), orbit and pivot, labels, roof code, skyways, hull outlines, isolate and cutaway. `makeCity(env)` takes the client's state and helpers. |
 | `app/core_sets.mjs` | The set core, with no DOM, d3, or three.js: model index, lifting, strongly connected groups and levels, grow operations, set boundary, Find queries, color classes, recipe replay. Shared by the client and the server. |
 | `test/sets.test.mjs` | Unit tests for `core_sets.mjs` on the demo model. |
+| `test/route.test.mjs` | Unit tests for `core_route.mjs`. |
+| `app/core_tree.mjs` | The optional Tree-sitter reader, with no DOM, d3, or three.js: loads grammars from `@vscode/tree-sitter-wasm` on first use, and yields symbols, typed names, and member accesses in the built-in parser's shapes. |
+| `test/tree.test.mjs` | Unit tests for `core_tree.mjs` and the parser setting; skipped when the optional package is missing. |
 | `test/client.test.mjs` | Playwright tests that drive every feature and save screenshots to `test/shots/`, plus the workflow tests. |
 | `package.json` | Dependencies and scripts. |
 
-Dependencies: `ws` (WebSocket server), `@openai/agents` and `openai` (agent), `d3` and `three` (served to the browser), `playwright` (tests).
+Dependencies: `ws` (WebSocket server), `@openai/agents` and `openai` (agent), `d3` and `three` (served to the browser), `playwright` (tests). Optional: `@vscode/tree-sitter-wasm` (the Tree-sitter parser); devibe runs without it.
 
 ## Server
 
@@ -90,11 +94,18 @@ Settings come from, in order of precedence: environment, `~/.devibe/config.json`
 | API key | `DEVIBE_API_KEY`, then `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | none | Never sent to the browser; the client only sees `hasKey`. |
 | Style guide | — | empty | Free text sent with every agent request. |
 | Max steps | — | 40 | Agent turn limit per request. |
+| Parser | `DEVIBE_PARSER` | `built-in` | `built-in` or `tree-sitter` (needs the optional `@vscode/tree-sitter-wasm` package). Changing it rescans every repo. |
+| Debug log | `DEVIBE_DEBUG` | off | Logs one line per scan to stderr: files, time, skipped files, parse time per language. |
 | Home folder | `DEVIBE_HOME` | `~/.devibe` | Holds `config.json` (mode 600) and `ledger/`. |
 
 ### Scanning
 
-1. **List files.** Inside git: `git ls-files -c -o --exclude-standard` (tracked plus untracked, minus ignored). Outside git: a walk that skips `node_modules`, `dist`, `build`, `bin`, `obj`, `target`, `vendor`, `.venv`, `__pycache__`, and other build or cache folders. At most 40,000 files.
+1. **List files.** Two kinds of folders are skipped:
+   - **Cache and package folders** are never source, so they are skipped even when committed: `node_modules`, `bower_components`, `.yarn`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.tox`, `site-packages`, `*.egg-info`, `.next`, `.nuxt`, `.svelte-kit`, `.angular`, `.parcel-cache`, `.turbo`, `.cache`, `.gradle`, `.terraform`, `.dart_tool`, `.idea`, `.vs`, `Pods`, `DerivedData`, and a few more.
+   - **Build output folders** (`dist`, `build`, `out`, `target`, `bin`, `obj`, `vendor`, `coverage`, `htmlcov`) are skipped unless their files are tracked, so a committed `bin/` of scripts still shows.
+   - Inside git: tracked files (`git ls-files -c`) minus cache folders, plus untracked files that are not ignored (`git ls-files -o --exclude-standard`, with both folder kinds passed as `--exclude` so git never walks into them).
+   - Outside git: a walk that skips both folder kinds and hidden folders (except `.github`), and honors every `.gitignore` on the way: globs, `**`, `!` negation, `/` anchors, and folder-only patterns; a deeper file's rules win, and a skipped folder is never entered.
+   - At most 40,000 files. With `DEVIBE_DEBUG` set, each scan logs its file count, time, and what each rule skipped to stderr.
 2. **Read files** 16 at a time. Binary files (a zero byte in the first 8 KB) are skipped. Files over 2 MB are listed with an estimated line count and marked generated.
 3. **Cache.** Facts are kept per file and reused while the file's size and modification time stay the same, so rescans only parse what changed.
 4. **Git history.** The last 3,000 commits give each file a commit count (churn) and last change time. `git status` marks uncommitted files.
@@ -102,7 +113,7 @@ Settings come from, in order of precedence: environment, `~/.devibe/config.json`
 
 ### Parsing
 
-Parsing is built in and heuristic: fast, dependency-free, and structural rather than compiler-exact.
+Parsing is built in and heuristic by default: fast, dependency-free, and structural rather than compiler-exact. The **Tree-sitter** parser (Settings → Parser, or `DEVIBE_PARSER=tree-sitter`) reads exact syntax trees instead, for the languages it covers (see [Tree-sitter](#tree-sitter)).
 
 **Masking.** Each code file is first copied with comments and string contents replaced by spaces, keeping every offset and newline. Later passes run on this masked copy so braces, keywords, and names inside strings or comments never confuse them. The masker knows line and block comments per language, escapes, Python and C# triple-quoted strings, C# verbatim strings, Go raw strings, JS template literals and regex literals, Rust raw strings and lifetimes.
 
@@ -128,6 +139,23 @@ Per function: **lines**, **branches** (`if`, loops, `case`, `catch`, `&&`, `||`,
 
 **File flags.** `gen` marks lock files, minified files (average line over 300 characters), and files whose head says generated or "do not edit". Generated files are drawn but skipped by checks and links. `test` marks test files by path and name.
 
+#### Tree-sitter
+
+`app/core_tree.mjs` reads syntax trees with `@vscode/tree-sitter-wasm`, an optional dependency (22 MB, no dependencies of its own: the WASM runtime and prebuilt grammars). `makeTrees()` returns a reader the Workspace makes on first use, which loads each grammar once when a scan first meets its language.
+
+- **Languages.** C#, C and C++ (one grammar), Go, Java, JavaScript (with JSX), PHP, Python, Ruby, Rust, TypeScript, TSX. Other languages, data files, imports, words, marks, and copies keep the built-in reader.
+- **Same shapes.** Each grammar handler yields the built-in parser's raw symbols (kind, form, name, offsets, body, parameters, bases, Go receiver) plus typed names and member accesses, so nesting, forms (method, ctor), branches, nesting depth, keys, linking, and checks run the same code for both parsers.
+- **What it gets right** where the heuristics fall short:
+  - Function-like macros (`#define SQR(x)`, Rust `macro_rules!`) are `func` symbols with the form `macro`.
+  - C++ templates, default template arguments, trailing return types, and out-of-class methods (`Box<T, U>::get` is named `Box::get`).
+  - Decorators and attributes stay off the name line; Python `metaclass=` is not a base.
+  - Anonymous lambdas are not symbols (named ones are), however deeply they nest.
+  - One-line interfaces and classes, overloads, `.d.ts` declarations, Go interface methods, and Rust unit structs.
+  - Typed names come from declarations as written (`Type name`, `name: Type`, `var x = new Foo()`, `x := &Foo{}`), and member accesses from member, field, selector, and scoped expressions, never from text inside strings or comments.
+- **Cache.** Facts record which parser read them (`parser: 'tree'`). Switching the setting rescans every repo, and a cached file is read again when its parser differs. A file that fails to parse falls back to the built-in reader.
+- **Keys.** Symbol keys are names, so a few can differ between parsers (C++ out-of-class templates, symbols only one parser finds). Review marks and saved sets on those keys do not carry over.
+- **Speed.** On a 1,200-file, 342k-line JS and TS tree, a first scan takes 3.9 s against 2.2 s with the built-in parser (parsing itself about 2.2 s). With `DEVIBE_DEBUG` set, each scan logs the parse time per language.
+
 ### Linking
 
 Links connect node ids and carry a kind and a weight (how many times).
@@ -135,8 +163,8 @@ Links connect node ids and carry a kind and a weight (how many times).
 | Kind | From → to | How |
 | --- | --- | --- |
 | `import` | file → file | Import specifiers resolved per language: relative paths with extension and index probing (JS/TS `.js`→`.ts`), `@/` and `~/` aliases, Python dotted and relative modules, Java/Kotlin/Scala packages and wildcards, Go module paths from `go.mod`, Rust `mod` and `use crate::/super::`, C/C++ includes, PHP namespaces, Ruby and Lua requires, CSS imports, HTML `src`/`href`, Dart packages. Unresolved package names are listed as the file's packages. |
-| `call` | symbol or file → function | A word in the source matches a function declared elsewhere. |
-| `use` | symbol or file → type | A word matches a type or namespace declared elsewhere. |
+| `call` | symbol or file → function | A member access (`store.Find`) links to the member of the receiver's type (see [Receivers](#receivers)); any other word links to a function of that name declared elsewhere. |
+| `use` | symbol or file → type | The same, for a type or namespace (`Action.Click`, `Outer.Inner`). |
 | `base` | type → type | A base type name matches a declared type. |
 | `copy` | symbol → symbol | Two places share a copied block (see [Copied code](#checks-reference)). |
 | `change` | file ↔ file | The files change in the same commits. Only commits touching 2–24 files count (bigger ones are formatting, renames, or merges). A pair is kept when it shares 3 or more commits and the shared count is at least 35% of the smaller file's commits; the top 4,000 pairs are kept. Stored once (lower id first) and drawn without arrowheads. |
@@ -146,6 +174,28 @@ Links connect node ids and carry a kind and a weight (how many times).
 **Sites.** For each link the model keeps up to 12 source lines: the import line, the reference line for calls and uses, the type's declaration for bases, where each copy starts, and none for `change`. Sites are a non-enumerable property of the model, so they never travel in `repo.model`; the client asks for them per file with `file.links` (up to 2,000 per file) when a file becomes readable or a link is selected.
 
 Name matching stays precise by: only linking within one language family (JS/TS/HTML, JVM, C/C++, or the same language); ignoring names declared more than 4 times; preferring, when a name has several declarations, the same file, then an imported file, then the same folder; skipping a symbol's own name and links between a node and its own ancestors or descendants. C# and Swift have no file imports, so their structure comes from type and call links.
+
+#### Receivers
+
+A member access links by the receiver's type instead of by name, which cuts false links (`Math.floor` no longer reaches a repo's `Vector2.floor`) and finds missing ones (a `Find` declared in 10 classes still links when the receiver is an `IOrderStore`).
+
+- **Facts.** Each file keeps typed names `[name, type, line]` and member accesses `[chain, name, line]`, read from the masked text (or from the syntax tree with the Tree-sitter parser).
+  - Typed names: `Type name` (C#, Java, Dart, C, C++), `name: Type` (TypeScript, Python, Kotlin, Scala, Swift, Rust), `Type $name` (PHP), Go parameters, receivers, `var` and struct fields, and constructions without a type written: `x = new Foo(`, `self.x = Foo()`, `@x = Foo.new`, `x := &Foo{}`, `x, err := NewFoo()`, `let x = Foo::new()`, `make_unique<Foo>()`.
+  - `@name` marks a member set through `this`/`self` in a method, or promoted by a constructor parameter (`constructor(private store: Store)`).
+  - Types are reduced to one name: generics, arrays, pointers, references, and nullable marks are dropped; `Optional`, `Option`, `Box`, `Rc`, `Arc`, smart pointers, and similar wrappers are unwrapped.
+  - Member accesses: `a.b`, `a?.b`, `a->b`, `A::b`, field chains (`this.store.Find`, `s.store.Find`), Ruby `@store.find`, PHP `$this->store->find()`. `this`, `self`, `Self`, `$this`, `cls` become `this`; `super`, `super()`, `base`, `parent` become `super`.
+- **Receiver type.** A receiver's type is a set of type or namespace nodes, found in this order:
+  - `this`: the enclosing type (or the type in a C++ `Foo::bar` or Go method name). `super`: its base types.
+  - A typed name in scope: the innermost function that types it, then the enclosing type's fields, then the file. A name given several types in that scope (reassigned across branches) may be any of them.
+  - A type or namespace name, for static access (`Helper.Find`, `Repo::new`, `Action.Click`).
+  - Each further link of a chain is the field of that name on the types so far (or a nested type), searching base types.
+- **Picking declarations.** A type name picks the nearest declarations the way names do: in the same file, the innermost enclosing scope that declares it, then imported files, then the same folder. More than 3 declarations left in different files is ambiguous, and the receiver counts as unknown. C# `partial` classes, Rust `impl` blocks, and Swift and Ruby reopened types pool their members.
+- **Linking.** The member is searched in the receiver's types, then their base types (6 levels). It matches members nested in the type, Go methods with that receiver in the same folder, and C++ out-of-class definitions (`Box::area`).
+  - Found: links go to those members only, even when the name is declared more than 4 times.
+  - Known external type (built-in types; Capitalized names that are not declared in the repo in C#, Java, Kotlin, Scala, Swift, Dart, Python, Ruby, PHP, Rust, C++; JS globals like `Math`, `JSON`, `console`), or a class without the member (a field or property): no link.
+  - Unknown receiver, a constructor function, or a type alias or interface without the member (their members are property signatures): link by name as before.
+
+On a 1,200-file, 342k-line JS and TS tree, receivers removed about 1,400 name-matched links (mostly calls on built-ins and same-named members of unrelated classes) and added about 2,500 (inherited members, static calls, and names declared more than 4 times), for about 0.4 s more scan time.
 
 ### Stage
 
@@ -164,8 +214,20 @@ Mechanical edits (no agent):
 | Edit | What it stages |
 | --- | --- |
 | Rename | Whole-word replacement of a type, function, or namespace name in code (not in strings or comments) across every non-data file. |
-| Move | A file or folder into another folder; files keep their relative layout. Or a type or function into a file: its line range, with attached attributes, decorators, and doc comments, is cut and appended to the target file after a blank line, and both files are staged. "Move + fix" also asks the agent to update imports and references. |
+| Move | A file or folder into another folder; files keep their relative layout. Or a type or function into a file: its line range, with attached attributes, decorators, and doc comments, is cut and put in the target file (inside a C# block namespace, reindented; else at the end after a blank line, two for top-level Python), and both files are staged. Imports are fixed with the move (see [Move fixes](#move-fixes)). "Move + fix" also asks the agent to check the staged changes and fix what is left. |
 | Delete | Files, folders (all files inside), or symbols (their line range, plus attached attributes, decorators, and doc comments). "Remove all" in the Unused code rule deletes every unused symbol it lists. |
+
+A symbol's line range takes the blank lines after it, or, when it ends a block or the file, the blank lines before it, so a cut leaves one gap where there were two.
+
+#### Move fixes
+
+A mechanical move rewrites what it breaks, so "Move only" leaves the code building, and stages those edits with the move. Files are resolved against the staged view (disk, minus staged deletes, plus staged adds), so several moves in a row build on each other.
+
+- **JS/TS and CSS.** Relative, `@/`, `~/`, and `/` specifiers are rewritten in the moved files and in every file that imports them, in each specifier's own form: with or without an extension, `.js` for a `.ts` file, a folder for its index file, an alias kept as an alias. Files that do not mention a moved file's name or folder are not read.
+- **Python.** Absolute modules (`from shop.util import fmt`, `import shop.util`) are written from the same root folder; relative ones (`from ..util import fmt`) from the file's new folder. `from pkg import module` follows a moved module, splitting the line when its names now live in different modules. `import a.b` without `as` also rewrites `a.b.name` uses in code.
+- **C#.** A namespace that mirrors its folder (`App.Orders` in `Orders/`, or the root namespace in a `.csproj` folder) follows the move (`App.Billing` in `Billing/`). Qualified names (`App.Orders.Order`) follow the moved types; files that use a moved type unqualified and cannot see its new namespace (through their own namespace, a `using`, or a `global using`) get a `using`; a moved file that still uses types from its old namespace gets one for that. Only files that name a moved type or the old namespace are read.
+- **Symbol moves.** The moved code takes along the imports it uses (respecified for the new file, merged out when they pointed at the new file); names it uses from the old file are imported from there (and exported in JS/TS). The old file imports the symbol back when it still uses it (exporting it in JS/TS). Files that import it by name from the old file import it from the new one (`import { a, moved }` and `from a import moved, stay` are split), and the new file drops its own import of it. A C# type that changes namespace gets the same `using` and qualified-name fixes as a moved file.
+- **Not fixed.** Default and namespace imports of a moved JS symbol, `import a` then `a.moved` in Python, other languages, dynamic imports, and paths in config files. "Move + fix" leaves those to the agent. The note after a move says how many other files were fixed.
 
 ### Ledger
 
@@ -189,10 +251,10 @@ The client is message-driven. `hub.emit(type, data)` runs every handler register
 | --- | --- | --- |
 | Tiles | three.js `InstancedBufferGeometry` with a custom shader | Every rectangle and circle in Map, Graph, and Layers: one instance each, with a signed-distance rounded box, antialiased edges, inner edge shading, and zoom-aware fading of file bodies as code becomes readable. Hundreds of thousands of tiles in one draw call. |
 | City boxes | three.js `InstancedBufferGeometry` box with a custom shader (`core_city.mjs`) | Plinths, lots, signs, podiums, towers, and shells. Each instance carries its previous and next geometry, so a morph costs one uniform per frame. Hemisphere and directional light, screen-space edge darkening, a brighter top when hovered. Two passes over one geometry: opaque, then ghosts (transparent, no depth write). |
-| Links | three.js `LineSegments2` (fat, antialiased screen-space lines) | Links as sampled curves with a dim-to-bright gradient from source to target, one group per line width, in three layers that rebuild only when their inputs change: the base (every link in All, or the faint backdrop of Graph and Layers), the set (its boundary and picked links), and the hover. Routes are cached per layout, and the last few base and hover layers are kept, so hovering and selecting never re-route the base. The sampled polylines are kept for picking; each bright link also keeps its arrowhead point and direction. |
+| Links | three.js `LineSegments2` (fat, antialiased screen-space lines) | Links as sampled curves with a dim-to-bright gradient from source to target, one group per line width, in three layers that rebuild only when their inputs change: the base (every link in All, or the faint backdrop of Graph and Layers), the set (its boundary and picked links), and the hover. Lines are opaque (colors are mixed toward the background instead of using alpha, so the round joins between segments never show as beads), 2.5–4 px for a set's links (heavier links thicker), 4 px for picked links, 1.9–2.8 px by kind in All, and 1.5 px for the faint backdrop. The set and hover layers draw a background-colored outline under their lines, so they stand clear of tiles, code, and the links below. In Graph a link is a gentle arc cut where it leaves the source circle and where it meets the target circle; in Layers it runs from the source box's edge to the target box's edge (an S-curve between rows, an arch over the tops within a row), with each end slid along the edge toward the other box so the links of one box fan out in the order of where they go. In Map it runs from edge to edge too, leaving where the line between the two boxes crosses the source's border and arriving the same way at the target's, at right angles to both sides; neighbors whose edges nearly touch get a link at least half the smaller box long, starting and ending inside them. Code ends (a line, or a symbol's first line at reading zoom) keep to the left and right sides of their column, beside the text: two lines of one column join through a bracket in the gutter to the left, and a line linked to another file runs level to its file's edge before it curves away, so links from one line share one trunk. In All, Map links cross the borders of the folders between their ends where those folders face each other, so links between the same two folders bundle without detouring through any folder's middle. Every route bows the same way whichever way it points, so A→B and B→A are one curve with an arrowhead at each end, never a loop (`core_route.mjs`). Routes are cached per layout, and the last few base and hover layers are kept, so hovering and selecting never re-route the base. The sampled polylines are kept for picking; each bright link also keeps its arrowhead point and direction. |
 | Ink | Canvas 2D on top of WebGL | Text and outlines with native font rendering: labels, code minimaps, code text, call-site marks, issue markers, arrowheads, selection and hover outlines, drag ghost, and in City the code on the roofs. Only what is visible and large enough is drawn. |
 
-d3 provides the layouts (`treemap`, `forceSimulation`, `quadtree`), zoom and pan (`d3-zoom`, including pinch), transitions and easing, curve sampling (`curveBundle`, `curveNatural`), and formatting.
+d3 provides the layouts (`treemap`, `forceSimulation`, `quadtree`), zoom and pan (`d3-zoom`, including pinch), transitions and easing, and formatting.
 
 World units are chosen so that one code line is about one unit, which keeps 32-bit GPU coordinates precise at any zoom. The view transform is applied to a scene group; City adds a rotation group (pitch and yaw, around a pivot) under it, so pan and zoom stay in screen space even in 3D. The camera is orthographic, so every world point maps to the screen affinely: `screen = O + x·u + y·v + z·w`, with `O`, `u`, `v`, `w` computed once per frame. Fitting, picking, roof text, and arrowheads all use this mapping.
 
@@ -205,13 +267,13 @@ Layout changes morph: each tile animates from its previous rectangle (or its par
 | Layout | Key | What it shows | How |
 | --- | --- | --- | --- |
 | Map | `1` | Repos, folders, files, and the code inside, nested and sized by lines. | Squarified treemap. Folder headers scale with folder size and are never smaller than file headers. Inside each file, code is laid out in columns of 84 characters (4 for line numbers); types and functions are bands over their line ranges, indented by depth. The treemap's shape follows the screen's shape, so phones and portrait tablets fill the screen. |
-| Graph | `2` | Parts at the chosen detail pulled together by their links. | Force simulation seeded from Map positions (so related folders stay near each other), with link, charge, collision, and home forces. Up to 4,000 nodes. Over 400 nodes it runs in a worker for up to 4 s while the view stays live ("Laying out the graph…"); otherwise in place for up to 1.1 s. Graph and Layers are kept per Detail until the Map changes, so switching back is instant. |
+| Graph | `2` | Parts at the chosen detail pulled together by their links. | Force simulation seeded from Map positions (so related folders stay near each other), with link, charge, collision, and home forces. Up to 4,000 nodes. Over 400 nodes it runs in a worker for up to 4 s while the view stays live ("Laying out the graph…"): coming from another layout, the parts wait as small dots at their seed places, with no links, so the Map's boxes never sit behind the Graph, then move to their places when it is done (an open Graph stays up instead). Otherwise it runs in place for up to 1.1 s. A morph that starts while another is running starts from where the tiles are. Graph and Layers are kept per Detail until the Map changes, so switching back is instant. |
 | Layers | `3` | Parts stacked by dependency: base code at the bottom, code that depends on it above. | Strongly connected groups share a level; each level is one more than the highest level it depends on. Rows are ordered by folder, then by four barycenter sweeps to cut crossings. Parts in a loop are tinted red. |
 | City | `4` | The Map extruded: folders are plinths, files are buildings, and close up a building opens into podiums (types) and towers (functions) standing on their own code. | Map rectangles as boxes. See [City](#city). |
 
 **Detail** (`D`): Folders, Files, Types, Functions. It sets the nodes of Graph and Layers and the level links are lifted to. Lifting walks a node up to the chosen level: a method's call becomes its type's or file's link.
 
-**Links** (`L`): Off; Focus (links of the set and the hovered part; Graph and Layers also show all links faintly); All (every link at the chosen detail, colored by kind). In Focus, a set's links are colored by its boundary: links inside the set violet, what it uses blue, what uses it orange. They are computed per set, so a link between two members is drawn once. In Map, links are bundled along the folder tree; in City they are skyways. Every bright link has an arrowhead at 92% along its curve (at most 600, heaviest first); `change` links have none. While you read code, links fade so they do not cover the text, and links of a readable file start from the exact line that makes them. The legend's link kinds show or hide each kind; "changes with" is off in All and on in Focus by default.
+**Links** (`L`): Off; Focus (links of the set and the hovered part; Graph and Layers also show all links faintly); All (every link at the chosen detail, colored by kind). In Focus, a set's links are colored by its boundary: links inside the set violet, what it uses blue, what uses it orange. They are computed per set, so a link between two members is drawn once. A link never ends on a part that holds its other end: where lifting would swallow it (a method's link into its own file), the end stays at the part just below the shared one (the sibling method or type). In Map at reading zoom, set and hover links end at the symbol they use, on its first line, so the arrow points at its definition. In Map, All links are bundled along the folder tree; in City they are skyways. Every bright link has an arrowhead sized to its line (at most 600, heaviest first): in the flat layouts its tip touches the target's edge; in City it sits 92% along the curve. `change` links have none. A bright link that runs off the free part of the screen gets a label where it leaves (`→ cart.ts › total()` for a target, `← Program.cs` for a source), outlined in the link's color; labels that meet stack along the edge (16 at most). While you read code, All links fade; text is drawn over links, so they never hide it. Links of a readable file start from the exact line that makes them. The legend's link kinds show or hide each kind; "changes with" is off in All and on in Focus by default.
 
 ### Zoom levels in Map
 
@@ -423,7 +485,7 @@ Every message is JSON: `{ type, data, id? }`. A request with an `id` gets exactl
 | `stage.preview` | `{ on }` | `ok` |
 | `review.mark` | `{ keys, on }` | `ok` |
 | `issue.waive` | `{ rule, key, on }` | `ok` |
-| `config.set` | `{ endpoint?, model?, apiKey?, style?, maxTurns? }` | `config.state` |
+| `config.set` | `{ endpoint?, model?, apiKey?, style?, maxTurns?, parser? }` | `config.state` (after a rescan when `parser` changed) |
 | `set.save` | `{ set }` (with an existing `id` it overwrites; without, a new set) | `sets.state` `{ sets, id }` |
 | `set.drop` | `{ id }` | `sets.state` |
 
@@ -437,7 +499,7 @@ Every message is JSON: `{ type, data, id? }`. A request with an `id` gets exactl
 | `agent.step` | `{ kind: 'start', text, act, mode, set, total? }`, `{ kind: 'text', text, index? }` (streamed), `{ kind: 'tool', name, args, note }`, or `{ kind: 'item', index, total, label, state: 'run' \| 'staged' \| 'none' \| 'error', files?, error? }` (one-by-one) |
 | `agent.done` | `{ text }`, `{ error, text }`, or for one-by-one `{ text, batch: { act, total, done, items } }` |
 | `sets.state` | `{ sets: [{ id, name, repo, nodes, links, ranges, recipe, at }] }` |
-| `config.state` | `{ endpoint, model, style, maxTurns, recent, hasKey, repos: [{ name, root }] }` |
+| `config.state` | `{ endpoint, model, style, maxTurns, parser, trees: { ready, langs }, recent, hasKey, repos: [{ name, root }] }`; `trees.ready` says the Tree-sitter package is installed, `langs` names the languages it covers. |
 | `note` | `{ level: 'info' \| 'good' \| 'error', text }` |
 
 ### Client hub messages
@@ -471,6 +533,7 @@ Every message is JSON: `{ type, data, id? }`. A request with an `id` gets exactl
 | `lines`, `from`, `to` | Line count (folders sum their files); symbol line range. |
 | `cx`, `nest`, `args` | Branches, nesting, parameters (functions). |
 | `head`, `bases` | First line of the declaration; base type names. |
+| `of` | Receiver type of a Go method declared in another file than its type. |
 | `churn`, `time`, `dirty` | Commits, last change (epoch seconds), uncommitted. |
 | `gen`, `test`, `ext` | Generated, test file, external packages imported. |
 | `root`, `branch` | Repo folder and git branch (repos). |
@@ -573,16 +636,23 @@ The first six are read tools; the last four are write tools. Paths start with th
 `server.test.mjs` (`node --test`):
 
 - Masking, symbols, and imports for every language family, including edge cases (verbatim strings, regex literals, lifetimes, control flow that looks like functions).
+- Scanning: `.gitignore` rules (globs, `**`, negation, anchors, folder-only, nested files), cache and build folders outside git, and in git (cache folders skipped even when tracked, build folders only when untracked).
+- Receivers: typed names and member accesses per language; calls linked by receiver type in C#, TypeScript, Python, Go, C++, Rust (fields, `this`, parameters, constructor parameter properties, base classes, static access, external types, names declared more than 4 times); constructor functions, namespaces, same-named types in other files, and partial classes.
 - The model on the demo repo: tree, every link kind, every planted finding, git history. Link sites match the file text and stay out of `JSON.stringify(model)`.
 - Changes-with links in a temporary git repo: pairs from commits of 2–24 files only, no new import or folder loops, and `couple` flagged until an import links the files.
 - Copies, loops, diff and hunks, stage apply/undo/conflict/move/delete/rename/preview, review staleness, waivers.
 - Range edits (replace, insert, refuse out of range, preview, undo), reverting one hunk at a time, moving a symbol with its doc comment and decorator, saved sets kept across restarts.
+- Move fixes on small repos on disk: JS/TS moves in a row (relative, `.js`, folder index, `@/` alias, a staged file fixed again, folder moves); Python absolute and relative modules, `from pkg import module`, and qualified uses; C# namespaces following folders with usings and qualified names; symbol moves in JS/TS, Python, and C# (imports carried along, imported back and exported, importers split, block namespace placement).
 - The set prompt: members, findings, inside links, and the interface with sites; its caps.
 - Config precedence and key privacy.
 - HTTP and WebSocket: static files, CSP, host and origin checks, path traversal, live watch updates, every new message.
 - The agent end to end through the real SDK against a mock streaming endpoint: tool calls, staged edit, streamed text, set and style guide in the request, history, connection test. Actions: read-only runs get no write tools (checked in the request), one by one makes a run per item with a fresh history and one summary, stop finishes the current item, and `show_links` lists kinds and sites.
 
 `sets.test.mjs` (`node --test`, no browser) runs on the demo model: the index, parts at a rank, lifted graphs without copies or changes-with, levels, grow out and in with hops, path, loop, copies, tests, inside, the boundary, reach, used by, query parsing with help for bad input, every filter, `classify` for every color with matching legend picks, link member expansion, and recipe replay on a rebuilt model.
+
+`tree.test.mjs` (`node --test`, no browser; skipped without the optional package) loads every grammar and checks Tree-sitter symbols where heuristics fall short (decorators, nested lambdas, macros, templates and out-of-class methods, unit structs, one-line interfaces) for every covered language, receiver facts and links from the tree, and the workspace's parser setting: tree facts per covered language, data files kept built in, no reparse without a change, and back.
+
+`route.test.mjs` (`node --test`, no browser) checks the link routes: Graph arcs end on both circle edges past the gap, arrive heading into the target, bow to one side, never turn back, and draw A→B and B→A as one curve; Layers curves leave the bottom edge and land on the top edge (or the reverse going up), fan out from one box in the order of their targets, arch over the tops within a row, and are one curve both ways; Map routes leave by the side facing the target (code ends beside their line), run border to border at right angles, stay long enough between neighbors to show direction, bracket through the gutter, run level from a code line to its file's edge, cross folder borders between the folders, and are one curve both ways.
 
 `client.test.mjs` (Playwright, `node --test`) starts a server with no repos and a mock model, then drives the UI like a user and saves one image per step to `test/shots/`:
 

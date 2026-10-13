@@ -143,6 +143,11 @@ describe('devibe client', () => {
     await page.evaluate(() => { const d = window.devibe; const id = d.state.T.byKey.get('acme-shop/web/src/checkout.ts#checkout'); d.hub.emit('pick.set', { ids: [id] }); d.flyTo(id, 0); });
     await idle();
     assert.ok(await state(() => window.devibe.state.texts.has('acme-shop/web/src/checkout.ts')));
+    // At reading zoom, links point at the symbols they use, never at a part
+    // that holds their other end.
+    const ends = await state(() => { const d = window.devibe, N = d.state.T.N; const up = (x, a) => { for (let p = x; p >= 0; p = N[p].up) if (p === a) return true; return false; }; return d.state.linkList.filter((e) => e.pts).map((e) => ({ a: N[e.a].key, b: N[e.b].key, nested: up(e.a, e.b) || up(e.b, e.a) })); });
+    assert.ok(ends.length && ends.every((e) => !e.nested), JSON.stringify(ends));
+    assert.ok(ends.some((e) => e.a.endsWith('#checkout') && e.b.includes('.ts#') && !e.b.startsWith('acme-shop/web/src/checkout.ts')), JSON.stringify(ends));
     await shot('04-code');
   });
 
@@ -154,6 +159,15 @@ describe('devibe client', () => {
     await page.locator('#info').waitFor({ state: 'visible' });
     assert.match(await page.locator('#info').textContent(), /Used by/);
     assert.ok(await state(() => window.devibe.state.linkList.length > 0));
+    // A Map link runs from its source's border to its target's border.
+    const edge = await page.evaluate(() => {
+      const d = window.devibe, rect = (k) => d.state.lay.rect.get(d.state.T.byKey.get(k));
+      const e = d.state.linkList.find((l) => l.dir === 'out' && d.state.T.N[l.b].key === 'acme-shop/web/src/utils.ts');
+      const on = (x, y, r) => Math.min(Math.abs(x - r.x), Math.abs(x - r.x - r.w), Math.abs(y - r.y), Math.abs(y - r.y - r.h)) < 1e-3 && x >= r.x - 1e-3 && x <= r.x + r.w + 1e-3 && y >= r.y - 1e-3 && y <= r.y + r.h + 1e-3;
+      const p = e.pts, n = p.length / 3;
+      return { from: on(p[0], p[1], rect('acme-shop/web/src/cart.ts')), to: on(p[n * 3 - 3], p[n * 3 - 2], rect('acme-shop/web/src/utils.ts')), tip: e.tip };
+    });
+    assert.deepEqual(edge, { from: true, to: true, tip: true });
     await shot('05-links');
   });
 
@@ -190,6 +204,21 @@ describe('devibe client', () => {
     assert.ok(await state(() => [...window.devibe.state.lay.rect.keys()].some((id) => window.devibe.state.T.N[id].kind === 'type')));
     await shot('09-graph-types');
     await page.locator('#tools select').first().selectOption('file');
+    await idle();
+    // A bright link ends on its target's edge, where its arrowhead's tip is.
+    await page.evaluate(() => { const d = window.devibe; d.hub.emit('pick.set', { ids: [d.state.T.byKey.get('acme-shop/web/src/cart.ts')] }); });
+    await idle();
+    const edge = await page.evaluate(() => {
+      const d = window.devibe, to = 'acme-shop/web/src/utils.ts';
+      const pts = d.linkPoints('acme-shop/web/src/cart.ts', to);
+      const c = d.centerOf(to), r = d.state.lay.rect.get(d.state.T.byKey.get(to)).w / 2 * d.state.t.k;
+      const e = d.state.linkList.find((l) => l.dir === 'out' && d.state.T.N[l.b].key === to);
+      return { off: Math.hypot(pts.at(-1)[0] - c[0], pts.at(-1)[1] - c[1]) - r, k: d.state.t.k, tip: e.tip };
+    });
+    assert.ok(edge.off > 0 && edge.off < 1.5 * edge.k + 1, `link ends ${edge.off}px off the edge at zoom ${edge.k}`);
+    assert.ok(edge.tip);
+    await page.keyboard.press('Escape');
+    await idle();
   });
 
   test('layers layout stacks files by dependency', async () => {
@@ -203,7 +232,12 @@ describe('devibe client', () => {
     await page.keyboard.press('4');
     await idle();
     assert.equal(await state(() => window.devibe.state.lay.kind), 'city');
+    assert.ok(await state(() => window.devibe.city.shown));
     await shot('11-city');
+    // Leaving City hides its buildings, so none stay behind other layouts.
+    await page.keyboard.press('3');
+    await idle();
+    assert.equal(await state(() => window.devibe.city.shown), false);
     await page.keyboard.press('1');
     await idle();
   });
@@ -322,8 +356,12 @@ describe('devibe client', () => {
   test('settings test the model connection', async () => {
     await page.locator('#tools button[aria-label="Settings"]').click();
     await page.locator('#setup-box').waitFor({ state: 'visible' });
+    const parser = page.locator('#setup-box [aria-label="Parser"]');
+    assert.equal(await parser.locator('button[aria-pressed="true"]').textContent(), 'Built-in');
+    assert.equal(await parser.locator('button', { hasText: 'Tree-sitter' }).isEnabled(), true, 'the optional package is installed');
     await page.locator('#setup-box button', { hasText: 'Test' }).click();
     await page.locator('#setup-box', { hasText: 'Connected' }).waitFor();
+    await page.locator('#setup-box .box-body').evaluate((el) => { el.scrollTop = el.scrollHeight; });
     await shot('22-settings');
     await page.locator('#setup-box button', { hasText: 'Cancel' }).click();
   });
@@ -652,7 +690,10 @@ describe('devibe client', () => {
     assert.match(await page.locator('#ask').textContent(), new RegExp(`Move clamp\\(\\) from utils\\.ts to ${path.basename(target[0]).replace('.', '\\.')}`));
     await shot('42-city-move');
     await page.locator('#ask button', { hasText: 'Move only' }).click();
-    await page.waitForFunction(() => window.devibe.state.stage.items.length === 2);
+    await page.waitForFunction(() => window.devibe.state.stage.items.length >= 2);
+    // cart.ts imports clamp: it follows the move (or loses the import when it is the target).
+    const keys = await page.evaluate(() => window.devibe.state.stage.items.map((i) => i.key));
+    assert.ok(keys.includes(`${S0}web/src/cart.ts`), keys.join(', '));
     await page.evaluate(() => window.devibe.wire.ask('stage.discard', {}));
     await page.waitForFunction(() => window.devibe.state.stage.items.length === 0);
   });

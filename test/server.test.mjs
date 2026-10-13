@@ -14,10 +14,14 @@ import WebSocket from 'ws';
 import {
   maskCode, readSymbols, readImports, readFacts, langOf, findCopies, strongGroups, diffLines, makeHunks,
   Workspace, buildModel, startServer, makeSample, runAgent, stopAgent, testAgent, loadConfig, setText, LINK_KINDS, ACTS,
+  listFiles, readIgnore, isIgnored, readTyped,
 } from '../app/server.mjs';
 
 const tmp = (name) => fs.mkdtempSync(path.join(os.tmpdir(), `devibe-${name}-`));
 const syms = (text, lang) => readSymbols(text, maskCode(text, lang), lang).map((s) => `${s.kind}:${s.form}:${s.name}@${s.from}-${s.to}`);
+// A model from in-memory files, and the targets each symbol calls or uses.
+const modelOf = (files, opts) => buildModel([{ name: 'r', root: '/r', facts: new Map(Object.entries(files).map(([rel, text]) => [rel, readFacts(rel, text, opts)])), texts: new Map(Object.entries(files)), git: null }]);
+const targets = (m, from, kind = 'call') => m.links.filter(([s, , k]) => m.nodes[s].key === `r/${from}` && LINK_KINDS[k] === kind).map(([, t]) => m.nodes[t].key.slice(2)).sort();
 
 // A tiny OpenAI-compatible chat endpoint. Each request answers with the next
 // scripted step: tool calls or text, streamed as server-sent events.
@@ -289,6 +293,111 @@ describe('changes with', () => {
   });
 });
 
+describe('scanning', () => {
+  const git = (cwd, ...args) => execFileSync('git', ['-c', 'init.defaultBranch=main', '-c', 'commit.gpgsign=false', '-c', 'core.autocrlf=false', ...args], { cwd, env: { ...process.env, GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@t' } });
+  const put = (dir, files) => { for (const f of files) { fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true }); fs.writeFileSync(path.join(dir, f), 'x\n'); } };
+  test('reads .gitignore patterns', () => {
+    const rules = readIgnore('# note\n*.log\n!keep.log\n/top.txt\nbuild/\ndocs/**/draft-*\n\\#hash\n[ab].tmp\n');
+    const hit = (p, dir = false) => isIgnored([{ base: '', rules }], p, dir);
+    assert.ok(hit('a.log') && hit('x/y/a.log') && !hit('keep.log') && !hit('x/keep.log'));
+    assert.ok(hit('top.txt') && !hit('x/top.txt'), 'a leading slash anchors');
+    assert.ok(hit('build', true) && hit('x/build', true) && !hit('build'), 'a trailing slash matches folders only');
+    assert.ok(hit('docs/draft-1.md') && hit('docs/a/b/draft-2.md') && !hit('docs/final.md'));
+    assert.ok(hit('#hash') && hit('a.tmp') && !hit('c.tmp'));
+    const nested = [{ base: '', rules }, { base: 'sub', rules: readIgnore('*.md\n!a.log\n') }];
+    assert.ok(isIgnored(nested, 'sub/x.md', false) && !isIgnored(nested, 'x.md', false), 'nested rules apply under their folder');
+    assert.ok(!isIgnored(nested, 'sub/a.log', false) && isIgnored(nested, 'b.log', false), 'deeper rules win');
+  });
+  test('outside git: skips cache and build folders and honors .gitignore files', async () => {
+    const dir = tmp('walk');
+    put(dir, ['src/a.py', 'src/b.log', 'src/keep.log', 'node_modules/m/i.js', '.venv/lib/x.py', 'pkg/__pycache__/a.pyc', 'build/out.js', 'x.egg-info/PKG', 'gen/deep/g.ts', 'sub/tmp/t.ts', 'sub/ok.ts', 'sub/notes.md']);
+    fs.writeFileSync(path.join(dir, '.gitignore'), '*.log\n!keep.log\n/gen/\n');
+    fs.writeFileSync(path.join(dir, 'sub/.gitignore'), 'tmp\n*.md\n');
+    const files = (await listFiles(dir)).sort();
+    assert.deepEqual(files, ['.gitignore', 'src/a.py', 'src/keep.log', 'sub/.gitignore', 'sub/ok.ts']);
+  });
+  test('in git: cache folders always skipped, build folders only when untracked', async () => {
+    const dir = path.join(tmp('lsgit'), 'r');
+    fs.mkdirSync(dir);
+    git(dir, 'init', '-q');
+    put(dir, ['src/a.ts', 'bin/run.sh', 'node_modules/kept/i.js', 'vendor/lib.go']);
+    git(dir, 'add', '-f', '.'); git(dir, 'commit', '-q', '-m', 'start');
+    put(dir, ['src/b.ts', 'dist/app.js', '.venv/lib/x.py', 'pkg/__pycache__/a.pyc', 'obj/Debug/a.dll', 'ignored/x.ts']);
+    fs.writeFileSync(path.join(dir, '.gitignore'), 'ignored/\n');
+    const files = (await listFiles(dir)).sort();
+    assert.deepEqual(files, ['.gitignore', 'bin/run.sh', 'src/a.ts', 'src/b.ts', 'vendor/lib.go']);
+  });
+});
+
+describe('receivers', () => {
+  test('reads typed names and member accesses', () => {
+    const cs = 'class S {\n  private readonly IOrderStore _store;\n  public void M(List<int> xs, Repo? r) {\n    var q = new Query<Order>();\n    _store.Find(1);\n    this._store.Save(q);\n    base.Run();\n  }\n}\n';
+    const t = readTyped(maskCode(cs, 'cs'), 'cs');
+    assert.deepEqual(t.vars, [['_store', 'IOrderStore', 2], ['xs', 'List', 3], ['r', 'Repo', 3], ['q', 'Query', 4]]);
+    assert.deepEqual(t.refs, [['_store', 'Find', 5], ['this', '_store', 6], ['this._store', 'Save', 6], ['super', 'Run', 7]]);
+    const py = 'class A:\n    store: Store\n    def __init__(self, cache: Cache):\n        self.repo = Repo()\n        repo = make()\n        self.repo.find(1)\n        super().save()\n';
+    const p = readTyped(maskCode(py, 'py'), 'py');
+    assert.deepEqual(p.vars, [['store', 'Store', 2], ['cache', 'Cache', 3], ['@repo', 'Repo', 4]]);
+    assert.deepEqual(p.refs, [['this', 'repo', 4], ['this', 'repo', 6], ['this.repo', 'find', 6], ['super', 'save', 7]]);
+    const go = 'func (s *Svc) Run(a, b Price, n int) {\n\tx := &Store{}\n\ty, err := NewCache()\n\tvar z Queue\n\ts.store.Find(1)\n}\n';
+    const g = readTyped(maskCode(go, 'go'), 'go');
+    assert.deepEqual(g.vars, [['s', 'Svc', 1], ['a', 'Price', 1], ['b', 'Price', 1], ['n', 'int', 1], ['x', 'Store', 2], ['y', 'Cache', 3], ['z', 'Queue', 4]]);
+    assert.deepEqual(g.refs, [['s', 'store', 5], ['s.store', 'Find', 5]]);
+  });
+  test('C#: a member access links to the member of the receiver type', () => {
+    const m = modelOf({
+      'Data/Store.cs': 'namespace App.Data;\npublic interface IOrderStore\n{\n    Order Find(int id);\n    void Save(Order o);\n}\npublic class SqlStore : IOrderStore\n{\n    public Order Find(int id) => null;\n    public void Save(Order o) {}\n}\npublic class MemStore : IOrderStore\n{\n    public Order Find(int id) => null;\n    public void Save(Order o) {}\n}\npublic class Other\n{\n    public void Find() {}\n}\npublic class More\n{\n    public void Find() {}\n}\n',
+      'Web/Service.cs': 'namespace App.Web;\npublic class Service\n{\n    private readonly IOrderStore _store;\n    private readonly List<int> _ids = new();\n    public void Run(MemStore mem)\n    {\n        _store.Find(1);\n        this._store.Save(null);\n        mem.Find(2);\n        _ids.Find(3);\n        Helper.Find(4);\n        Console.Find(5);\n    }\n}\npublic static class Helper { public static int Find(int x) => x; }\n',
+    });
+    assert.deepEqual(targets(m, 'Web/Service.cs#App.Web.Service.Run'), ['Data/Store.cs#App.Data.IOrderStore.Find', 'Data/Store.cs#App.Data.IOrderStore.Save', 'Data/Store.cs#App.Data.MemStore.Find', 'Web/Service.cs#App.Web.Helper.Find']);
+  });
+  test('TypeScript: this, fields, constructor parameter properties, and parameters', () => {
+    const m = modelOf({
+      'cart.ts': 'export class Cart {\n  total() { return 1; }\n}\nexport class Box {\n  total() { return 2; }\n}\n',
+      'app.ts': "import { Cart, Box } from './cart';\nexport class App {\n  private cart = new Cart();\n  constructor(private box: Box) {}\n  run(list: string[], other: Box) {\n    this.cart.total();\n    this.box.total();\n    other.total();\n    list.total();\n    this.size();\n  }\n  size() { return 0; }\n}\nexport function total() { return 3; }\n",
+    });
+    assert.deepEqual(targets(m, 'app.ts#App.run'), ['app.ts#App.size', 'cart.ts#Box.total', 'cart.ts#Cart.total']);
+  });
+  test('Python: self fields, annotated parameters, base classes', () => {
+    const m = modelOf({
+      'store.py': 'class Base:\n    def save(self):\n        pass\n\nclass Store(Base):\n    def find(self, x):\n        return x\n\nclass Cache:\n    def find(self, x):\n        return x\n',
+      'svc.py': 'from .store import Store, Cache\n\nclass Service:\n    def __init__(self):\n        self.store = Store()\n\n    def run(self, cache: Cache):\n        self.store.find(1)\n        self.store.save()\n        cache.find(2)\n        self.done()\n\n    def done(self):\n        pass\n',
+    });
+    assert.deepEqual(targets(m, 'svc.py#Service.run'), ['store.py#Base.save', 'store.py#Cache.find', 'store.py#Store.find', 'svc.py#Service.done']);
+  });
+  test('Go: receivers, struct fields, and methods declared in other files', () => {
+    const m = modelOf({
+      'a.go': 'package p\n\ntype Store struct{}\n\ntype Svc struct {\n\tstore Store\n}\n',
+      'b.go': 'package p\n\nfunc (s *Store) Find(id int) {}\n\nfunc (s *Svc) Run() {\n\ts.store.Find(1)\n}\n',
+      'c.go': 'package p\n\ntype Other struct{}\n\nfunc (o Other) Find(id int) {}\n',
+    });
+    assert.deepEqual(targets(m, 'b.go#Run'), ['b.go#Find']);
+  });
+  test('constructor functions, namespaces, same-named types, and partial classes', () => {
+    const m = modelOf({
+      'poly.js': 'function CubicPoly() {\n  return { calc: function () { return 1; } };\n}\nconst px = new CubicPoly();\nexport function curve() {\n  return px.calc();\n}\n',
+      'events.ts': 'export type Action = Action.Click | Action.Move;\nexport namespace Action {\n  export interface Click { x: number }\n  export interface Move { y: number }\n}\n',
+      'a/base.ts': 'export class WSBase {\n  reconnect() { return 1; }\n  run() { return this.reconnect(); }\n}\n',
+      'b/base.ts': 'export class WSBase {\n  reconnect() { return 2; }\n  run() { return this.reconnect(); }\n}\n',
+      'Parts/A.cs': 'namespace P;\npublic partial class Shop\n{\n    public void Open() { Close(); this.Close(); }\n}\n',
+      'Parts/B.cs': 'namespace P;\npublic partial class Shop\n{\n    public void Close() {}\n}\n',
+    });
+    assert.deepEqual(targets(m, 'poly.js#curve'), ['poly.js#CubicPoly.calc'], 'a constructor function is not an external type');
+    assert.deepEqual(targets(m, 'events.ts#Action', 'use'), ['events.ts#Action~2.Click', 'events.ts#Action~2.Move'], 'namespace members');
+    assert.deepEqual(targets(m, 'b/base.ts#WSBase.run'), ['b/base.ts#WSBase.reconnect'], 'this is the enclosing type, not a same-named one');
+    assert.deepEqual(targets(m, 'Parts/A.cs#P.Shop.Open'), ['Parts/B.cs#P.Shop.Close'], 'partial classes pool their members');
+  });
+  test('C++ out-of-class methods and Rust impl blocks', () => {
+    const m = modelOf({
+      'shapes.hpp': 'struct Box {\n  int area();\n};\nstruct Ring {\n  int area();\n};\n',
+      'shapes.cpp': '#include "shapes.hpp"\n\nint Box::area() {\n  return 1;\n}\n\nint total(Box* b, Ring r) {\n  return b->area() + r.area();\n}\n',
+      'lib.rs': 'pub struct Store;\n\nimpl Store {\n    pub fn find(&self) -> i32 {\n        1\n    }\n}\n\npub struct Cache;\n\nimpl Cache {\n    pub fn find(&self) -> i32 {\n        2\n    }\n}\n\npub fn run(s: &Store) -> i32 {\n    s.find()\n}\n',
+    });
+    assert.deepEqual(targets(m, 'shapes.cpp#total'), ['shapes.cpp#Box::area', 'shapes.hpp#Box.area', 'shapes.hpp#Ring.area']);
+    assert.deepEqual(targets(m, 'lib.rs#run'), ['lib.rs#Store.find']);
+  });
+});
+
 describe('helpers', () => {
   test('findCopies groups repeated blocks', () => {
     const block = Array.from({ length: 10 }, (_, i) => `total = total + values[${i}] * rate;`);
@@ -471,6 +580,118 @@ describe('stage and ledger', () => {
     await third.open(dir);
     assert.ok(!third.setsState().sets.some((x) => x.id === id));
     assert.throws(() => space.saveSet({ name: 'x', nodes: [] }), /empty/);
+  });
+});
+
+describe('move fixes', () => {
+  // A workspace on a small repo written to disk; `read` gives staged text.
+  const open = async (files) => {
+    const dir = path.join(tmp('fix'), 'r');
+    for (const [rel, text] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+      fs.writeFileSync(path.join(dir, rel), text);
+    }
+    const space = new Workspace({ home: tmp('home'), watch: false });
+    await space.open(dir);
+    return { space, read: (rel) => space.stage.read(`r/${rel}`), staged: () => space.stage.list().map((i) => `${i.state} ${i.path}`).sort() };
+  };
+
+  test('JS/TS file moves fix the moved file and its importers, one move after another', async () => {
+    const { space, read, staged } = await open({
+      'src/app.ts': "import { util } from './lib/util';\nimport { other } from './lib/other.js';\nimport * as ui from './ui';\nexport const app = util() + other() + ui.x;\n",
+      'src/lib/util.ts': "import { other } from './other';\nimport { x } from '../ui/index';\nexport function util() { return other() + x; }\n",
+      'src/lib/other.ts': 'export function other() { return 1; }\n',
+      'src/ui/index.ts': 'export const x = 1;\n',
+      'src/deep/a.ts': "import {\n  util,\n} from '@/lib/util';\nexport const a = util;\n",
+      'src/core/keep.ts': 'export const keep = 1;\n',
+    });
+    space.moveFile('r/src/lib/util.ts', 'r/src/core');
+    assert.equal(read('src/core/util.ts'), "import { other } from '../lib/other';\nimport { x } from '../ui/index';\nexport function util() { return other() + x; }\n");
+    assert.match(read('src/app.ts'), /^import \{ util \} from '\.\/core\/util';\n/);
+    assert.match(read('src/deep/a.ts'), /from '@\/core\/util';/, 'aliases keep their form');
+    space.moveFile('r/src/lib/other.ts', 'r/src/core');
+    assert.match(read('src/app.ts'), /import \{ other \} from '\.\/core\/other\.js';/, '.js specifiers keep their extension');
+    assert.match(read('src/core/util.ts'), /^import \{ other \} from '\.\/other';/, 'a staged file is fixed again');
+    space.moveFile('r/src/ui', 'r/src/core');
+    assert.match(read('src/app.ts'), /import \* as ui from '\.\/core\/ui';/, 'folder imports follow the folder');
+    assert.match(read('src/core/util.ts'), /import \{ x \} from '\.\/ui\/index';/);
+    assert.deepEqual(staged(), ['add src/core/other.ts', 'add src/core/ui/index.ts', 'add src/core/util.ts', 'delete src/lib/other.ts', 'delete src/lib/util.ts', 'delete src/ui/index.ts', 'edit src/app.ts', 'edit src/deep/a.ts']);
+  });
+
+  test('Python file moves fix absolute and relative modules and qualified uses', async () => {
+    const { space, read } = await open({
+      'shop/__init__.py': '',
+      'shop/util.py': 'def fmt(x):\n    return x\n',
+      'shop/orders/__init__.py': '',
+      'shop/orders/svc.py': 'from shop.util import fmt\nfrom ..util import fmt as f2\nimport shop.util\nfrom shop import util\n\n\ndef run():\n    return shop.util.fmt(1) + util.fmt(2) + f2(3)\n',
+      'shop/orders/model.py': 'from . import svc\nfrom .svc import run\n',
+      'shop/core/__init__.py': '',
+    });
+    space.moveFile('r/shop/util.py', 'r/shop/core');
+    assert.equal(read('shop/orders/svc.py'), 'from shop.core.util import fmt\nfrom ..core.util import fmt as f2\nimport shop.core.util\nfrom shop.core import util\n\n\ndef run():\n    return shop.core.util.fmt(1) + util.fmt(2) + f2(3)\n');
+    space.moveFile('r/shop/orders/svc.py', 'r/shop/core');
+    assert.equal(read('shop/core/svc.py').split('\n')[1], 'from .util import fmt as f2', 'the moved file\'s relative imports');
+    assert.equal(read('shop/orders/model.py'), 'from ..core import svc\nfrom ..core.svc import run\n');
+  });
+
+  test('C# file moves: the namespace follows the folder; usings and qualified names follow the types', async () => {
+    const { space, read } = await open({
+      'App.csproj': '<Project Sdk="Microsoft.NET.Sdk" />\n',
+      'Orders/Order.cs': 'namespace App.Orders;\n\npublic class Order\n{\n    public Money Total { get; set; }\n}\n',
+      'Orders/Money.cs': 'namespace App.Orders;\n\npublic class Money { }\n',
+      'Orders/Service.cs': 'namespace App.Orders\n{\n    public class Service\n    {\n        public Order Make() => new Order();\n    }\n}\n',
+      'Web/Page.cs': 'using System;\n\nnamespace App.Web;\n\npublic class Page\n{\n    public App.Orders.Order Load() => new App.Orders.Order();\n}\n',
+      'Billing/Keep.cs': 'namespace App.Billing;\n\npublic class Keep { }\n',
+    });
+    space.moveFile('r/Orders/Order.cs', 'r/Billing');
+    assert.equal(read('Billing/Order.cs'), 'using App.Orders;\n\nnamespace App.Billing;\n\npublic class Order\n{\n    public Money Total { get; set; }\n}\n');
+    assert.equal(read('Orders/Service.cs'), 'using App.Billing;\n\nnamespace App.Orders\n{\n    public class Service\n    {\n        public Order Make() => new Order();\n    }\n}\n');
+    assert.equal(read('Web/Page.cs'), 'using System;\n\nnamespace App.Web;\n\npublic class Page\n{\n    public App.Billing.Order Load() => new App.Billing.Order();\n}\n', 'qualified names change; no using needed');
+    assert.equal(read('Orders/Money.cs'), 'namespace App.Orders;\n\npublic class Money { }\n', 'files that do not use the type stay');
+  });
+
+  test('symbol moves: JS/TS importers, imports carried along, and the old file imports it back', async () => {
+    const { space, read } = await open({
+      'src/a.ts': "import { dep } from './dep';\n\nexport function moved() {\n  return dep() + local();\n}\n\nfunction local() {\n  return 1;\n}\n\nexport function stay() {\n  return moved();\n}\n",
+      'src/dep.ts': 'export function dep() { return 2; }\n',
+      'src/b.ts': 'export const b = 1;\n',
+      'src/user.ts': "import { moved, stay } from './a';\nexport const u = moved() + stay();\n",
+      'src/sub/user2.ts': "import { moved } from '../a';\nexport const u2 = moved();\n",
+    });
+    space.moveSymbol('r/src/a.ts#moved', 'r/src/b.ts');
+    assert.equal(read('src/b.ts'), "import { dep } from './dep';\nimport { local } from './a';\n\nexport const b = 1;\n\nexport function moved() {\n  return dep() + local();\n}\n");
+    assert.equal(read('src/a.ts'), "import { dep } from './dep';\nimport { moved } from './b';\n\nexport function local() {\n  return 1;\n}\n\nexport function stay() {\n  return moved();\n}\n");
+    assert.equal(read('src/user.ts'), "import { stay } from './a';\nimport { moved } from './b';\nexport const u = moved() + stay();\n");
+    assert.equal(read('src/sub/user2.ts'), "import { moved } from '../b';\nexport const u2 = moved();\n");
+  });
+
+  test('symbol moves: Python from-imports, carried imports, and the old module imports it back', async () => {
+    const { space, read } = await open({
+      'pkg/__init__.py': '',
+      'pkg/a.py': 'import os\nfrom .dep import dep\n\n\ndef moved():\n    return dep() + os.getpid() + local()\n\n\ndef local():\n    return 1\n\n\ndef stay():\n    return moved()\n',
+      'pkg/dep.py': 'def dep():\n    return 2\n',
+      'pkg/b.py': 'X = 1\n',
+      'pkg/user.py': 'from pkg.a import moved, stay\n',
+      'pkg/sub/__init__.py': '',
+      'pkg/sub/user2.py': 'from ..a import moved\n',
+    });
+    space.moveSymbol('r/pkg/a.py#moved', 'r/pkg/b.py');
+    assert.equal(read('pkg/b.py'), 'import os\nfrom .dep import dep\nfrom .a import local\n\nX = 1\n\n\ndef moved():\n    return dep() + os.getpid() + local()\n');
+    assert.equal(read('pkg/a.py'), 'import os\nfrom .dep import dep\nfrom .b import moved\n\n\ndef local():\n    return 1\n\n\ndef stay():\n    return moved()\n');
+    assert.equal(read('pkg/user.py'), 'from pkg.a import stay\nfrom pkg.b import moved\n');
+    assert.equal(read('pkg/sub/user2.py'), 'from ..b import moved\n');
+  });
+
+  test('symbol moves: C# types land inside a block namespace and bring usings', async () => {
+    const { space, read } = await open({
+      'Orders/Order.cs': 'namespace App.Orders\n{\n    public class Order { }\n\n    public class Line\n    {\n        public Order Parent;\n    }\n}\n',
+      'Billing/Bill.cs': 'namespace App.Billing\n{\n    public class Bill { }\n}\n',
+      'Web/Page.cs': 'using App.Orders;\n\nnamespace App.Web;\n\npublic class Page { public Line L; }\n',
+    });
+    space.moveSymbol('r/Orders/Order.cs#App.Orders.Line', 'r/Billing/Bill.cs');
+    assert.equal(read('Billing/Bill.cs'), 'using App.Orders;\n\nnamespace App.Billing\n{\n    public class Bill { }\n\n    public class Line\n    {\n        public Order Parent;\n    }\n}\n');
+    assert.equal(read('Orders/Order.cs'), 'namespace App.Orders\n{\n    public class Order { }\n}\n');
+    assert.equal(read('Web/Page.cs'), 'using App.Orders;\nusing App.Billing;\n\nnamespace App.Web;\n\npublic class Page { public Line L; }\n');
   });
 });
 

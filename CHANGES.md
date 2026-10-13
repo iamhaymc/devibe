@@ -1,1 +1,20 @@
 # ⏬ Devibe — Changes
+
+## 0.1.0
+
+- [x] [perf] Cache and package folders (`node_modules`, `.venv`, `__pycache__`, `.next`, `.gradle`, `*.egg-info`, …) are skipped everywhere, even when committed; build output folders (`dist`, `build`, `bin`, `obj`, `target`, `vendor`, `coverage`) only when untracked. In git, untracked files are listed with both kinds excluded so git never walks into them; outside git, every `.gitignore` is honored (globs, `**`, negation, anchors, folder-only patterns, nested files). `DEVIBE_DEBUG` logs what each rule skipped.
+- [x] [parsing] Optional Tree-sitter parser (`@vscode/tree-sitter-wasm`, Settings → Parser or `DEVIBE_PARSER=tree-sitter`) for C#, C/C++, Go, Java, JavaScript, PHP, Python, Ruby, Rust, TypeScript, TSX: exact symbols for macros, templates and out-of-class methods, decorators, nested lambdas, one-line interfaces, overloads, and unit structs, plus typed names and member accesses from the tree. It yields the built-in parser's shapes, so nesting, checks, and links are shared; facts are cached per parser, and switching rescans. `app/core_tree.mjs`, `test/tree.test.mjs`.
+- [x] [linking] Member accesses link by the receiver's type (`_store.Find` → `IOrderStore.Find`): typed fields, parameters, locals, and constructions per language; `this`, `super`, field chains, static access; nearest declarations with lexical scoping; partial classes, impl blocks, and reopened types pooled; base types searched. External receivers (`Math.floor`, `string.Join`, `List<T>.Find`) no longer link to same-named repo functions, and names declared more than 4 times link when the receiver picks one.
+- [x] [reshape] "Move only" fixes imports: JS/TS and CSS specifiers in their own form (extension, `.js` for `.ts`, folder index, aliases), Python absolute and relative modules and `import a.b` uses, and C# namespaces that follow their folder with usings and qualified names. Symbol moves carry their imports, import back what they leave behind, and retarget the files that import them; C# types land inside block namespaces. A symbol's cut takes its surrounding blank lines cleanly.
+- [x] [view] Graph no longer shows the Map's boxes behind it while a large graph lays out in the worker: the parts wait as small dots at their seed places, then move into the graph.
+- [x] [view] Graph links are arcs cut at the circle edges, with the arrowhead's tip on the target's edge instead of inside a circle.
+- [x] [view] Layers links run from box edge to box edge, with ends that fan out toward the other box, and the arrowhead's tip on the target's edge.
+- [x] [view] A→B and B→A links share one curve with an arrowhead at each end, instead of crossing into a loop.
+- [x] [view] A layout switch during a running morph starts from where the tiles are, instead of jumping.
+- [x] [view] Leaving City hides its glass shells: they no longer stay behind Graph, Layers, and Map as colored boxes.
+- [x] [view] Map links run from box edge to box edge at right angles to both sides, instead of from box middles through folder headers; links between neighbors stay long enough to show their arrowhead.
+- [x] [view] A link never ends on a part that holds its other end (a method's link into its own file now goes to the sibling it uses), and at reading zoom set and hover links end on the first line of the symbol they use.
+- [x] [view] Code-line links keep beside the text: lines of one column join through a gutter bracket, and links to other files run level to the file's edge as one trunk before they curve away.
+- [x] [view] All links in Map bundle where they cross folder borders, instead of detouring through folder middles.
+- [x] [view] Links are thicker (2.5–4 px in Focus, by weight), opaque with a background outline, smoother (32+ points per curve), and keep full strength while code is read; arrowheads scale with the line and touch the target's edge in Map too.
+- [x] [view] Bright links that run off screen are labeled where they leave with the part at their far end (→ target, ← source).

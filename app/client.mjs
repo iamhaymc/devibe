@@ -9,6 +9,7 @@ import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import * as S from './core_sets.mjs';
 import { makeCity } from './core_city.mjs';
 import { simulate } from './core_force.mjs';
+import { arcRoute, layerRoute, boxRoute, gutterRoute, bundleRoute, codeRoute } from './core_route.mjs';
 
 const d3 = window.d3;
 
@@ -90,7 +91,7 @@ const THEMES = {
 };
 const LINK_COLOR = { out: 0, in: 1, inside: 6, import: 0, call: 2, use: 6, base: 3, copy: 4 };
 // Line widths per kind, in pixels; changes-with links are thin and faint.
-const LINK_WIDTH = { import: 1.6, call: 1.8, use: 1.3, base: 2.2, copy: 1.3, change: 1.0 };
+const LINK_WIDTH = { import: 2.2, call: 2.4, use: 1.9, base: 2.8, copy: 1.9, change: 1.4 };
 const TK = { txt: 0, kw: 1, str: 2, num: 3, com: 4, type: 5, fn: 6, pun: 7 };
 
 const UI_FONT = 'Inter, "SF Pro Text", -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
@@ -628,6 +629,17 @@ function graphOf(T, { nodes, links }) {
   return { kind: 'graph', items, rect, quad, nodes, links, bounds: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } };
 }
 
+// While a large Graph lays out in the worker, its parts wait as small dots at
+// their seed places, with no links, so the Map's boxes never sit behind the
+// Graph. Dots are about 2.5 px once fitted.
+function graphWait(T, seed) {
+  const v = viewport();
+  const [x0, x1] = d3.extent(seed.nodes, (n) => n.x), [y0, y1] = d3.extent(seed.nodes, (n) => n.y);
+  const k = 0.94 * Math.min(v.w / Math.max(x1 - x0, 1), v.h / Math.max(y1 - y0, 1));
+  const r = 2.5 / k;
+  return Object.assign(graphOf(T, { nodes: seed.nodes.map((n) => ({ ...n, r })), links: seed.links }), { pending: true });
+}
+
 // Run the force layout in a worker; resolves to the nodes' new positions.
 // Falls back to running in place when workers are unavailable.
 const forceWorker = { w: null, seq: 0, waits: new Map() };
@@ -925,20 +937,23 @@ useLayout.uid = 0;
 function useLayout(next, { animate = true, fit = false } = {}) {
   const prev = state.lay;
   const isCity = next.kind === 'city';
-  if (!isCity) ensureTiles(next.items.length);
   const motion = animate && !!prev && !reduced();
+  // A morph still running starts the next one from where the tiles are now.
+  const cur = motion && R.morph && prev.kind !== 'city' ? R.quad.getAttribute('iRect')?.array : null;
+  if (!isCity) ensureTiles(next.items.length);
   let from = null;
   if (!isCity && motion && prev.kind !== 'city') {
-    const old = new Map(prev.items.map((it) => [it.key, it]));
+    const at = (i) => { const o = prev.items[i]; return cur ? [cur[i * 4], -cur[i * 4 + 1] - cur[i * 4 + 3], cur[i * 4 + 2], cur[i * 4 + 3]] : [o.x, o.y, o.w, o.h]; };
+    const old = new Map(prev.items.map((it, i) => [it.key, i]));
     const oldNode = new Map();
-    for (const it of prev.items) if (!oldNode.has(it.nk) || it.part === 'body' || it.part === 'dir' || it.part === 'node') oldNode.set(it.nk, it);
+    prev.items.forEach((it, i) => { if (!oldNode.has(it.nk) || it.part === 'body' || it.part === 'dir' || it.part === 'node') oldNode.set(it.nk, i); });
     const N = state.T.N;
     from = next.items.map((it) => {
       const o = old.get(it.key) ?? old.get(it.nk + (next.kind === 'map' ? '|b' : '|n'));
-      if (o) return [o.x, o.y, o.w, o.h];
+      if (o !== undefined) return at(o);
       let p = oldNode.get(it.nk);
-      for (let a = it.id > 0 ? N[it.id].up : -1; !p && a > 0; a = N[a].up) p = oldNode.get(N[a].key);
-      if (p) return [p.x + p.w / 2, p.y + p.h / 2, 0, 0];
+      for (let a = it.id > 0 ? N[it.id].up : -1; p === undefined && a > 0; a = N[a].up) p = oldNode.get(N[a].key);
+      if (p !== undefined) { const [x, y, w, h] = at(p); return [x + w / 2, y + h / 2, 0, 0]; }
       return [it.x + it.w / 2, it.y + it.h / 2, 0, 0];
     });
   }
@@ -985,6 +1000,8 @@ function relayout(opts = {}) {
     if (seed.nodes.length > 400) {
       R.laying = true;
       drawStatus();
+      // An open Graph stays up while the next one lays out.
+      if (state.lay?.kind !== 'graph') useLayout(graphWait(T, seed), opts);
       const flat = state.flat;
       simulateOff(seed).then((xy) => {
         if (xy) seed.nodes.forEach((n, i) => { n.x = xy[i * 2]; n.y = xy[i * 2 + 1]; });
@@ -1023,34 +1040,61 @@ function focusIds() {
 // unless the legend says otherwise.
 const kindOn = (kind) => state.kinds[kind] ?? (kind === 'change' || kind === 'copy' ? state.links === 'focus' : true);
 
-// The node a link end attaches to in the current layout.
-function endOf(id, rank = detailRank()) {
-  const lay = state.lay;
-  if (lay.kind === 'graph' || lay.kind === 'layers') return liftTo(id, rank);
-  if (lay.kind === 'city') return city.endOf(id, rank);
-  return liftTo(id, Math.max(rank, Math.min(RANK[state.T.N[id].kind], 3)));
+// The nearest symbol that has code lines (a type or function, not a
+// namespace), or the file when there is none.
+function symbolOf(id) {
+  const N = state.T.N;
+  let x = id;
+  while (x > 0 && N[x].kind !== 'file' && !(N[x].from && N[x].kind !== 'space')) x = N[x].up;
+  return x;
+}
+
+// The node a link end attaches to in the current layout: lifted to the
+// Detail, but never onto a part that holds the other end (`other`), so a
+// method's link into its own file goes to the sibling part it uses. In the Map
+// with `fine` ends, an end in readable code stays at the symbol it names, so
+// the arrow points at its definition. -1 when one end holds the other.
+function endOf(id, rank = detailRank(), other = -1, fine = false) {
+  const lay = state.lay, T = state.T;
+  let e;
+  if (lay.kind === 'graph' || lay.kind === 'layers') e = liftTo(id, rank);
+  else if (lay.kind === 'city') e = city.endOf(id, rank);
+  else e = fine && readable(T.fileOf[id]) ? symbolOf(id) : liftTo(id, Math.max(rank, Math.min(RANK[T.N[id].kind], 3)));
+  if (other <= 0 || (e !== other && !isUnder(other, e))) return e;
+  let x = id;
+  while (x > 0 && !isUnder(other, T.N[x].up)) x = T.N[x].up;
+  return x === other || isUnder(other, x) ? -1 : x;
 }
 
 function anchorOf(id) {
   const lay = state.lay;
   if (!lay) return null;
   if (lay.kind === 'city') return city.anchor(id);
-  if (lay.kind === 'map') {
-    const T = state.T;
-    const f = T.fileOf[id];
-    if (f >= 0 && f !== id) {
-      const pc = lay.pieces.get(f)?.find((it) => it.id === id);
-      if (pc) return [pc.x + Math.min(pc.w, 6 * (lay.code.get(f)?.lh ?? 1)) / 2, pc.y + Math.min(pc.h, lay.code.get(f)?.lh ?? 1) / 2];
-      const r = lay.rect.get(f);
-      return r ? [r.x + r.w / 2, r.y + r.h / 2] : null;
-    }
-    const r = lay.rect.get(id);
-    if (!r) return null;
-    const kind = state.T.N[id].kind;
-    return kind === 'dir' || kind === 'repo' ? [r.x + Math.min(r.w / 2, r.head * 4), r.y + r.head / 2] : [r.x + r.w / 2, r.y + r.h / 2];
-  }
   const r = lay.rect.get(id);
   return r ? [r.x + r.w / 2, r.y + r.h / 2] : null;
+}
+
+// A code line's box in the Map: its row across the whole column. Links keep
+// to its left and right sides, beside the text (the right side is where the
+// line's → mark is).
+function lineBox(fileId, line) {
+  const c = state.lay.code?.get(fileId);
+  if (!c) return null;
+  const j = Math.floor((line - 1) / c.rows), r = (line - 1) % c.rows;
+  return { x: c.x + j * (c.colW + c.gap), y: c.y + r * c.lh, w: c.colW, h: c.lh, sides: 'h', file: fileId, col: j };
+}
+
+// A link end's box in the Map, with the file it is in (-1 for folders): a
+// code line for a site ([file, line]); a symbol's first line when its code is
+// readable, else its band; a file's or folder's rect.
+function endBox(id, site) {
+  const lay = state.lay, T = state.T;
+  if (site) return lineBox(site[0], site[1]);
+  const f = T.fileOf[id];
+  const pc = f >= 0 && f !== id ? lay.pieces.get(f)?.find((it) => it.id === id && it.first) : null;
+  if (pc) return readable(f) ? lineBox(f, T.N[id].from) : { x: pc.x, y: pc.y, w: pc.w, h: pc.h, file: f };
+  const r = lay.rect.get(f >= 0 ? f : id);
+  return r ? { x: r.x, y: r.y, w: r.w, h: r.h, file: f } : null;
 }
 
 // Where a code line sits in the layout: the start of its text in its column.
@@ -1100,7 +1144,9 @@ const linkCtx = () => {
   const lay = state.lay;
   const flat = lay.kind === 'graph' || lay.kind === 'layers';
   const rank = detailRank();
-  return { T: state.T, m: state.model, lay, rank, flat, visible: flat ? (id) => lay.rect.has(id) : () => true, end: (id) => endOf(id, rank) };
+  // Set and hover links in the Map end at symbols in readable code.
+  const fine = lay.kind === 'map';
+  return { T: state.T, m: state.model, lay, rank, flat, visible: flat ? (id) => lay.rect.has(id) : () => true, end: (id, other = -1) => endOf(id, rank, other, fine) };
 };
 const heaviest = (map, cap) => [...map.values()].sort((p, q) => q.w - p.w).slice(0, cap);
 
@@ -1125,7 +1171,8 @@ function baseLinks() {
 }
 
 // Set layer: the set's boundary (Focus) and its link members. At reading zoom,
-// link members leave from the exact lines where they happen.
+// link members leave from the exact lines where they happen (sites, [file,
+// line]).
 function setLinks() {
   const { T, m, rank, flat, visible, end } = linkCtx();
   const { merged, put } = merger(visible);
@@ -1142,13 +1189,13 @@ function setLinks() {
           if (!kindOn(kind) || isUnder(t, f)) continue;
           const mt = memberOf(t);
           if (mt >= 0) put(self, flat ? liftTo(mt, rank) : mt, kind, w, 'inside');
-          else put(self, end(t), kind, w, 'out');
+          else put(self, end(t, self), kind, w, 'out');
         }
         for (const li of T.inn[id]) {
           const [src, , k, w] = m.links[li];
           const kind = m.linkKinds[k];
           if (!kindOn(kind) || isUnder(src, f) || memberOf(src) >= 0) continue;
-          put(end(src), self, kind, w, 'in');
+          put(end(src, self), self, kind, w, 'in');
         }
       }, 6000);
     }
@@ -1159,8 +1206,8 @@ function setLinks() {
       const kind = m.linkKinds[k];
       const f = T.fileOf[s];
       const lines = !flat && f >= 0 && readable(f) ? siteLines(li) : [];
-      if (lines.length) for (const line of lines) put(s, end(t), kind, w, 'pick', { member: l, pa: siteAnchor(f, line), tag: '@' + line });
-      else put(end(s), end(t), kind, w, 'pick', { member: l });
+      if (lines.length) for (const line of lines) put(s, end(t, s), kind, w, 'pick', { member: l, sa: [f, line], tag: '@' + line });
+      else put(end(s, t), end(t, s), kind, w, 'pick', { member: l });
     }
   }
   return heaviest(merged, 4000);
@@ -1175,46 +1222,26 @@ function hoverLinks() {
   const site = state.hoverSite;
   if (site) {
     const sites = state.sites.get(T.N[site.file].key);
-    const at = siteAnchor(site.file, site.line);
+    const at = [site.file, site.line];
     for (const x of sites?.out ?? []) {
       if (x.line !== site.line) continue;
       const s = idOf(x.from), t = idOf(x.to);
-      if (s >= 0 && t >= 0 && kindOn(x.kind)) put(s, end(t), x.kind, 1, 'out', { pa: at, tag: '@' + site.line });
+      if (s >= 0 && t >= 0 && kindOn(x.kind)) put(s, end(t, s), x.kind, 1, 'out', { sa: at, tag: '@' + site.line });
     }
     for (const x of sites?.in ?? []) {
       const t = idOf(x.to), s = idOf(x.from);
       if (t < 0 || s < 0 || T.N[t].from !== site.line || T.fileOf[t] !== site.file || !kindOn(x.kind)) continue;
-      put(end(s), t, x.kind, 1, 'in', { pb: at, tag: '@' + site.line });
+      put(end(s, t), t, x.kind, 1, 'in', { sb: at, tag: '@' + site.line });
     }
   } else if (state.hover > 0 && !selIds().includes(state.hover)) {
     const f = state.hover;
     const self = flat ? liftTo(f, rank) : f;
     walk(f, (id) => {
-      for (const li of T.out[id]) { const [, t, k, w] = m.links[li]; const kind = m.linkKinds[k]; if (kindOn(kind) && !isUnder(t, f)) put(self, end(t), kind, w, 'out'); }
-      for (const li of T.inn[id]) { const [src, , k, w] = m.links[li]; const kind = m.linkKinds[k]; if (kindOn(kind) && !isUnder(src, f)) put(end(src), self, kind, w, 'in'); }
+      for (const li of T.out[id]) { const [, t, k, w] = m.links[li]; const kind = m.linkKinds[k]; if (kindOn(kind) && !isUnder(t, f)) put(self, end(t, self), kind, w, 'out'); }
+      for (const li of T.inn[id]) { const [src, , k, w] = m.links[li]; const kind = m.linkKinds[k]; if (kindOn(kind) && !isUnder(src, f)) put(end(src, self), self, kind, w, 'in'); }
     }, 6000);
   }
   return heaviest(merged, 800);
-}
-
-// Sample a d3 curve into points by drawing it into a recording context.
-function sampleCurve(points, curve, steps = 6) {
-  const out = [];
-  let cx = 0, cy = 0;
-  const ctx = {
-    moveTo(x, y) { out.push([x, y]); cx = x; cy = y; },
-    lineTo(x, y) { out.push([x, y]); cx = x; cy = y; },
-    bezierCurveTo(x1, y1, x2, y2, x, y) {
-      for (let i = 1; i <= steps; i++) {
-        const t = i / steps, u = 1 - t;
-        out.push([u * u * u * cx + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x, u * u * u * cy + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y]);
-      }
-      cx = x; cy = y;
-    },
-    closePath() {},
-  };
-  d3.line().curve(curve).context(ctx)(points);
-  return out;
 }
 
 // Points as a flat xyz array.
@@ -1225,12 +1252,17 @@ function flatPts(pts) {
 }
 
 // A link's path in layout units (flat xyz). Routes between parts are cached
-// per layout; City routes follow open buildings, so City asks every time.
+// per layout (Map symbol ends per readable or not); City routes follow open
+// buildings, so City asks every time.
 function routeOf(e) {
   const lay = state.lay;
-  if (lay.kind === 'city') { const pts = city.route(e); return pts ? flatPts(pts) : null; }
-  const cache = !e.pa && !e.pb ? (lay.routes ??= new Map()) : null;
-  const key = cache && `${e.a}>${e.b}`;
+  if (lay.kind === 'city') {
+    const pts = city.route(e.sa || e.sb ? { ...e, pa: e.sa && city.siteAnchor(...e.sa), pb: e.sb && city.siteAnchor(...e.sb) } : e);
+    return pts ? flatPts(pts) : null;
+  }
+  const cache = !e.sa && !e.sb ? (lay.routes ??= new Map()) : null;
+  const fine = (id) => (lay.kind === 'map' && state.T.fileOf[id] !== id && readable(state.T.fileOf[id]) ? 'r' : '');
+  const key = cache && `${e.a}>${e.b}${e.dir ? '' : '~'}${fine(e.a)}${fine(e.b)}`;
   if (cache?.has(key)) return cache.get(key);
   const pts = routeOf2d(e, lay);
   const out = pts ? flatPts(pts) : null;
@@ -1238,76 +1270,94 @@ function routeOf(e) {
   return out;
 }
 
+// Every flat route runs from the source's edge to the target's edge
+// (core_route.mjs). Map: two lines of one code column join through the
+// gutter; a code line linked to another file runs level to its file's edge
+// first; set and hover links go straight between their boxes; All bundles
+// where links cross the borders of the folders between the ends.
 function routeOf2d(e, lay) {
-  const a = e.pa ?? anchorOf(e.a), b = e.pb ?? anchorOf(e.b);
-  if (!a || !b) return null;
   if (lay.kind === 'map') {
+    const A = endBox(e.a, e.sa), B = endBox(e.b, e.sb);
+    if (!A || !B) return null;
+    if (A.sides && B.sides && A.file === B.file && A.col === B.col) return A.y === B.y ? null : gutterRoute(A.x, A.y + A.h / 2, B.y + B.h / 2, { min: A.h * 0.9, max: A.h * 1.8 });
+    const FA = A.sides && A.file !== B.file ? lay.rect.get(A.file) : null, FB = B.sides && B.file !== A.file ? lay.rect.get(B.file) : null;
+    if (FA || FB) return codeRoute(A, B, FA, FB);
+    if (e.dir) return boxRoute(A, B);
     const pa = pathOf(e.a), pb = pathOf(e.b);
     let i = 0;
     while (i < pa.length && i < pb.length && pa[i] === pb[i]) i++;
-    const via = [...pa.slice(Math.max(i - 1, 0), -1).reverse(), ...pb.slice(Math.max(i - 1, 0), -1)].map(anchorOf).filter(Boolean);
-    const pts = [a, ...via.slice(0, 8), b];
-    return pts.length > 2 ? sampleCurve(pts, d3.curveBundle.beta(0.82), 5) : [a, b];
+    const folder = (id) => (['dir', 'repo'].includes(state.T.N[id].kind) ? lay.rect.get(id) : null);
+    const outA = pa.slice(i, -1).reverse().map(folder).filter(Boolean), inB = pb.slice(i, -1).map(folder).filter(Boolean);
+    return bundleRoute(A, B, outA.slice(-4), inB.slice(0, 4));
   }
-  if (lay.kind === 'layers') {
-    const ra = lay.rect.get(e.a), rb = lay.rect.get(e.b);
-    if (Math.abs(ra.y - rb.y) < 1) {
-      const lift = 14 + Math.abs(a[0] - b[0]) * 0.08;
-      return sampleCurve([[a[0], ra.y], [(a[0] + b[0]) / 2, ra.y - lift], [b[0], rb.y]], d3.curveNatural, 6);
-    }
-    const down = ra.y < rb.y;
-    const y0 = down ? ra.y + ra.h : ra.y, y1 = down ? rb.y : rb.y + rb.h;
-    const out = [];
-    for (let i = 0; i <= 14; i++) {
-      const t = i / 14, u = 1 - t;
-      const my = (y0 + y1) / 2;
-      out.push([u * u * u * a[0] + 3 * u * u * t * a[0] + 3 * u * t * t * b[0] + t * t * t * b[0], u * u * u * y0 + 3 * u * u * t * my + 3 * u * t * t * my + t * t * t * y1]);
-    }
-    return out;
-  }
-  const dx = b[0] - a[0], dy = b[1] - a[1];
-  const mx = (a[0] + b[0]) / 2 - dy * 0.12, my = (a[1] + b[1]) / 2 + dx * 0.12;
-  const out = [];
-  for (let i = 0; i <= 10; i++) {
-    const t = i / 10, u = 1 - t;
-    out.push([u * u * a[0] + 2 * u * t * mx + t * t * b[0], u * u * a[1] + 2 * u * t * my + t * t * b[1]]);
-  }
-  return out;
+  const a = anchorOf(e.a), b = anchorOf(e.b);
+  if (!a || !b) return null;
+  const ra = lay.rect.get(e.a), rb = lay.rect.get(e.b);
+  if (lay.kind === 'layers') return layerRoute(ra, rb);
+  return arcRoute(a, ra.w / 2, b, rb.w / 2);
 }
 
-// The color, width, and strength a drawn link gets.
+// The color, width, and strength a drawn link gets. Heavier links are drawn
+// thicker and stronger; widths come in half pixels so links share meshes.
+const halfPx = (w) => Math.round(w * 2) / 2;
 function linkStyle(e, maxW) {
   const th = theme();
-  const strength = e.dir === 'dim' ? 0.3 + 0.25 * Math.sqrt(e.w / maxW) : 0.45 + 0.55 * Math.sqrt(e.w / maxW);
-  if (e.dir === 'dim') return { color: rgb(th.ink3), width: 1.1, strength };
-  if (e.dir === 'pick') return { color: rgb(th.accent), width: 2.6, strength: 1 };
-  if (e.dir) return { color: rgb(th.series[LINK_COLOR[e.dir]]), width: e.kind === 'change' && e.kinds.size === 1 ? 1 : 1.8, strength: e.kind === 'change' && e.kinds.size === 1 ? strength * 0.5 : strength };
+  const share = Math.sqrt(e.w / maxW);
+  const strength = e.dir === 'dim' ? 0.3 + 0.25 * share : e.dir ? 0.75 + 0.25 * share : 0.5 + 0.5 * share;
+  const only = e.kind === 'change' && e.kinds.size === 1;
+  if (e.dir === 'dim') return { color: rgb(th.ink3), width: 1.5, strength };
+  if (e.dir === 'pick') return { color: rgb(th.accent), width: 4, strength: 1 };
+  if (e.dir) return { color: rgb(th.series[LINK_COLOR[e.dir]]), width: only ? 1.5 : halfPx(2.5 + 1.5 * share), strength: only ? strength * 0.5 : strength };
   if (e.kind === 'change') return { color: rgb(th.ink2), width: LINK_WIDTH.change, strength: strength * 0.5 };
-  return { color: rgb(th.series[LINK_COLOR[e.kind] ?? 0]), width: LINK_WIDTH[e.kind] ?? 1.4, strength };
+  return { color: rgb(th.series[LINK_COLOR[e.kind] ?? 0]), width: halfPx((LINK_WIDTH[e.kind] ?? 2) * (0.8 + 0.4 * share)), strength };
 }
 
+// Lines are opaque, with colors mixed toward the background instead of alpha,
+// so the round joins between segments never show as beads.
 function lineMat(width) {
   let m = R.lineMats.get(width);
   if (!m) {
-    m = new LineMaterial({ linewidth: width, vertexColors: true, transparent: true, opacity: 0.85, depthTest: false, depthWrite: false, worldUnits: false });
+    m = new LineMaterial({ linewidth: width, vertexColors: true, transparent: true, opacity: 1, depthTest: false, depthWrite: false, worldUnits: false });
     m.resolution.set(R.W || 1, R.H || 1);
     R.lineMats.set(width, m);
   }
   return m;
 }
 
-// Route a layer's links, note where each arrowhead goes (92% along), and
-// build its GPU lines: one mesh per line width, colors fading in toward the
-// target.
-function drawLayer(layer, list, maxW) {
+// One GPU mesh of line segments, all of one width.
+function lineMesh(layer, width, segs, order, fill) {
+  const pos = new Float32Array(segs * 6), col = new Float32Array(segs * 6);
+  fill(pos, col);
+  const geo = new LineSegmentsGeometry();
+  geo.setPositions(pos);
+  geo.setColors(col);
+  const mat = lineMat(width);
+  mat.depthTest = state.lay?.kind === 'city';
+  const lines = new LineSegments2(geo, mat);
+  lines.frustumCulled = false;
+  lines.renderOrder = order;
+  layer.group.add(lines);
+}
+
+// Route a layer's links, note where each arrowhead goes (its tip on the
+// target's edge in the flat layouts, 92% along in City), and build its GPU
+// lines: one mesh per line width, colors fading in toward the target. Bright
+// layers (`cased`) get a background-colored outline under their lines, so they
+// stand clear of tiles, code, and the links below. `quiet` links (All, while
+// code is read) are drawn fainter.
+function drawLayer(layer, list, maxW, { cased = false, quiet = false } = {}) {
   const bg = rgb(theme().bg);
+  const kind = state.lay?.kind;
+  const atEdge = kind !== 'city';
   const groups = new Map();
   for (const e of list) {
     const p = routeOf(e);
     e.pts = p;
     if (!p || p.length < 6) continue;
     const st = linkStyle(e, maxW);
+    if (quiet) st.strength *= 0.45;
     e.color = st.color;
+    e.width = st.width;
     e.fill = null;
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, len = 0;
     const n = p.length / 3;
@@ -1319,8 +1369,9 @@ function drawLayer(layer, list, maxW) {
     e.box = [x0, y0, x1, y1];
     e.len = len;
     e.arrow = null;
+    e.tip = atEdge;
     if (e.dir !== 'dim' && !(e.kind === 'change' && e.kinds.size === 1) && len > 0) {
-      let goal = len * 0.92, i = 1;
+      let goal = atEdge ? len : len * 0.92, i = 1;
       for (; i < n; i++) {
         const seg = Math.hypot(p[i * 3] - p[i * 3 - 3], p[i * 3 + 1] - p[i * 3 - 2], p[i * 3 + 2] - p[i * 3 - 1]);
         if (goal <= seg || i === n - 1) {
@@ -1337,32 +1388,36 @@ function drawLayer(layer, list, maxW) {
     g.list.push([e, st]);
     g.segs += n - 1;
   }
-  const depth = state.lay?.kind === 'city';
-  for (const [width, g] of groups) {
-    if (!g.segs) continue;
-    const pos = new Float32Array(g.segs * 6), col = new Float32Array(g.segs * 6);
+  const segsOf = (g, fill) => (pos, col) => {
     let o = 0;
     for (const [e, st] of g.list) {
-      const p = e.pts, n = p.length / 3, c = st.color;
+      const p = e.pts, n = p.length / 3;
       for (let i = 1; i < n; i++) {
         pos[o] = p[i * 3 - 3]; pos[o + 1] = -p[i * 3 - 2]; pos[o + 2] = p[i * 3 - 1];
         pos[o + 3] = p[i * 3]; pos[o + 4] = -p[i * 3 + 1]; pos[o + 5] = p[i * 3 + 2];
-        const t0 = (0.25 + 0.75 * ((i - 1) / (n - 1))) * st.strength, t1 = (0.25 + 0.75 * (i / (n - 1))) * st.strength;
-        for (let j = 0; j < 3; j++) { col[o + j] = bg[j] + (c[j] - bg[j]) * t0; col[o + 3 + j] = bg[j] + (c[j] - bg[j]) * t1; }
+        fill(col, o, st, (i - 1) / (n - 1), i / (n - 1));
         o += 6;
       }
     }
-    const geo = new LineSegmentsGeometry();
-    geo.setPositions(pos);
-    geo.setColors(col);
-    const mat = lineMat(width);
-    mat.depthTest = depth;
-    const lines = new LineSegments2(geo, mat);
-    lines.frustumCulled = false;
-    lines.renderOrder = layer.order;
-    layer.group.add(lines);
+  };
+  for (const [width, g] of groups) {
+    if (!g.segs) continue;
+    if (cased) lineMesh(layer, width + 3, g.segs, layer.order - 0.5, segsOf(g, (col, o) => { for (let j = 0; j < 3; j++) col[o + j] = col[o + 3 + j] = bg[j]; }));
+    lineMesh(layer, width, g.segs, layer.order, segsOf(g, (col, o, st, u0, u1) => {
+      const c = st.color, t0 = (0.4 + 0.6 * u0) * st.strength, t1 = (0.4 + 0.6 * u1) * st.strength;
+      for (let j = 0; j < 3; j++) { col[o + j] = bg[j] + (c[j] - bg[j]) * t0; col[o + 3 + j] = bg[j] + (c[j] - bg[j]) * t1; }
+    }));
   }
   layer.list = list;
+}
+
+// How many Map files read as text at this zoom. Map link ends move with it:
+// into a file's code lines once it reads.
+function readCount() {
+  const lay = state.lay;
+  if (lay?.kind !== 'map') return '';
+  const lhs = (lay.lhs ??= [...lay.code.values()].map((c) => c.lh).sort((a, b) => a - b));
+  return lhs.length - d3.bisectLeft(lhs, 7.5 / state.t.k);
 }
 
 // Rebuild the link layers whose inputs changed (all of them with `force`,
@@ -1371,13 +1426,15 @@ function buildLinks({ force = false } = {}) {
   const L = R.linkLayers;
   if (!L) return;
   const lay = state.lay;
-  const live = !!lay && !!state.T;
+  const live = !!lay && !!state.T && !lay.pending;
+  const quiet = live && state.links === 'all' && readingCode();
+  const reads = live ? readCount() : '';
   const base = live ? `${lay.uid}|${state.T.uid}|${detailRank()}|${state.links}|${JSON.stringify(state.kinds)}|${theme().bg}` : '';
   const pickSig = live ? state.set.links.slice(0, 50).map((l) => { const a = idOf(l[0]); const f = a >= 0 ? state.T.fileOf[a] : -1; return f >= 0 && readable(f) ? 1 : 0; }).join('') : '';
   const sigs = {
-    base,
-    set: live ? `${base}|${state.setVer}|${pickSig}|${state.set.links.length ? state.sitesVer ?? 0 : ''}` : '',
-    hover: live && state.links === 'focus' ? `${base}|${state.setVer}|${state.hover}|${state.hoverSite ? `${state.hoverSite.file}:${state.hoverSite.line}|${state.sitesVer ?? 0}` : ''}` : '',
+    base: live ? `${base}|${quiet}|${detailRank() > 3 ? reads : ''}` : '',
+    set: live ? `${base}|${state.setVer}|${pickSig}|${reads}|${state.set.links.length ? state.sitesVer ?? 0 : ''}` : '',
+    hover: live && state.links === 'focus' ? `${base}|${state.setVer}|${state.hover}|${reads}|${state.hoverSite ? `${state.hoverSite.file}:${state.hoverSite.line}|${state.sitesVer ?? 0}` : ''}` : '',
   };
   let changed = false;
   let maxW = 1;
@@ -1400,7 +1457,7 @@ function buildLinks({ force = false } = {}) {
       const list = !live ? [] : name === 'base' ? baseLinks() : name === 'set' ? setLinks() : hoverLinks();
       const w = d3.max(list, (e) => e.w) ?? 1;
       layer.maxW = name === 'base' ? w : Math.max(maxW, w);
-      drawLayer(layer, list, layer.maxW);
+      drawLayer(layer, list, layer.maxW, { cased: name !== 'base', quiet: name === 'base' && quiet });
     }
     if (name !== 'base') maxW = Math.max(maxW, layer.maxW);
     layer.sig = sigs[name];
@@ -1510,8 +1567,6 @@ function drawFrame(now) {
   R.base.position.set(-R.pivot[0], R.pivot[1], -R.pivot[2]);
   R.tilt.rotation.set(-R.pitch, 0, R.yaw);
   R.links.visible = !R.morph;
-  const quiet = readingCode();
-  for (const m of R.lineMats.values()) m.opacity = quiet ? 0.3 : 0.85;
   R.renderer.render(R.scene, R.camera);
   drawInk(now);
   if (state.flash.size) {
@@ -2086,28 +2141,32 @@ function inkGrip(ctx) {
   for (let i = 0; i < 3; i++) for (let j = 0; j < 2; j++) ctx.fillRect(grip.x + grip.w / 2 - 3 + j * 4, grip.y + grip.h / 2 - 5 + i * 4, 2, 2);
 }
 
-// Arrowheads at 92% along each bright link (600 at most, heaviest first),
-// and the hovered link drawn thicker. Changes-with links have no direction.
+// Arrowheads on bright links (600 at most, heaviest first), sized to the
+// line: tip on the target's edge in the flat layouts, 92% along in City.
+// Links that run off screen are labeled where they leave (inkEnds). The
+// hovered link is drawn thicker, over a background outline. Changes-with
+// links have no direction.
 function inkLinks(ctx) {
   if (R.morph || !state.arrows?.length && !state.hoverLink) return;
   const A = affine();
   const city3d = state.lay.kind === 'city';
   const k = state.t.k;
-  const quiet = readingCode() ? 0.45 : 1;
+  const quiet = state.links === 'all' && readingCode();
   let drawn = 0;
   for (const e of state.arrows ?? []) {
     if (drawn >= 600) break;
-    if (e.len * k < 14) continue;
+    if (e.len * k < 4) continue;
     const [px, py, pz, tx, ty, tz] = e.arrow;
-    const x = A.O[0] + px * A.u[0] + py * A.v[0] + pz * A.w[0], y = A.O[1] + px * A.u[1] + py * A.v[1] + pz * A.w[1];
+    let x = A.O[0] + px * A.u[0] + py * A.v[0] + pz * A.w[0], y = A.O[1] + px * A.u[1] + py * A.v[1] + pz * A.w[1];
     if (x < -10 || y < -10 || x > R.W + 10 || y > R.H + 10) continue;
     if (city3d && city.hidden(px, py, pz)) continue;
     let dx = tx * A.u[0] + ty * A.v[0] + tz * A.w[0], dy = tx * A.u[1] + ty * A.v[1] + tz * A.w[1];
     const d = Math.hypot(dx, dy);
     if (!d) continue;
     dx /= d; dy /= d;
-    const size = e.dir === 'pick' ? 9 : 7;
-    ctx.fillStyle = (e.fill ??= [css(e.color, 1), css(e.color, 0.45)])[quiet === 1 ? 0 : 1];
+    const size = 4 + (e.width ?? 2) * 1.8;
+    if (e.tip) { x -= dx * size * 0.6; y -= dy * size * 0.6; }
+    ctx.fillStyle = (e.fill ??= [css(e.color, 1), css(e.color, 0.45)])[quiet && !e.dir ? 1 : 0];
     ctx.beginPath();
     ctx.moveTo(x + dx * size * 0.6, y + dy * size * 0.6);
     ctx.lineTo(x - dx * size * 0.6 - dy * size * 0.45, y - dy * size * 0.6 + dx * size * 0.45);
@@ -2116,15 +2175,77 @@ function inkLinks(ctx) {
     ctx.fill();
     drawn++;
   }
+  inkEnds(ctx, A);
   const hv = state.hoverLink;
   if (hv?.pts) {
     const xy = linkScreen(hv, A);
-    ctx.strokeStyle = css(hv.color ?? rgb(theme().accent), 0.95);
-    ctx.lineWidth = 3.2;
-    ctx.lineJoin = 'round';
+    const w = (hv.width ?? 2.5) + 2;
+    ctx.lineJoin = ctx.lineCap = 'round';
     ctx.beginPath();
     for (let i = 0; i < xy.length; i += 2) (i ? ctx.lineTo(xy[i], xy[i + 1]) : ctx.moveTo(xy[i], xy[i + 1]));
+    ctx.strokeStyle = theme().bg;
+    ctx.lineWidth = w + 3;
     ctx.stroke();
+    ctx.strokeStyle = css(hv.color ?? rgb(theme().accent), 1);
+    ctx.lineWidth = w;
+    ctx.stroke();
+    ctx.lineCap = 'butt';
+  }
+}
+
+// Where a bright link runs off the free part of the screen, a label names the
+// part at its far end (→ the target, ← the source), so links into the
+// distance still say where they go. The heaviest 300 links are checked; labels
+// that meet stack along the screen's edge, and are left out when there is no
+// room.
+function inkEnds(ctx, A) {
+  const v = viewport(), T = state.T;
+  const x0 = v.x + 4, y0 = v.y + 4, x1 = v.x + v.w - 4, y1 = v.y + v.h - 4;
+  const inside = (x, y) => x >= x0 && x <= x1 && y >= y0 && y <= y1;
+  const th = theme();
+  const taken = [], named = new Set();
+  ctx.font = `600 11px ${UI_FONT}`;
+  let seen = 0;
+  for (const e of state.arrows ?? []) {
+    if (taken.length >= 16 || ++seen > 300) break;
+    if (!e.dir || e.dir === 'dim') continue;
+    const xy = linkScreen(e, A), n = xy.length / 2;
+    for (const far of [true, false]) {
+      const end = far ? n - 1 : 0, step = far ? -1 : 1;
+      if (inside(xy[end * 2], xy[end * 2 + 1])) continue;
+      let i = end;
+      while (i >= 0 && i < n && !inside(xy[i * 2], xy[i * 2 + 1])) i += step;
+      if (i < 0 || i >= n) continue;
+      // Bisect the segment that crosses the border.
+      let ix = xy[i * 2], iy = xy[i * 2 + 1], ox = xy[(i - step) * 2], oy = xy[(i - step) * 2 + 1];
+      for (let j = 0; j < 12; j++) { const mx = (ix + ox) / 2, my = (iy + oy) / 2; if (inside(mx, my)) { ix = mx; iy = my; } else { ox = mx; oy = my; } }
+      const id = far ? e.b : e.a, f = T.fileOf[id];
+      const name = f >= 0 && f !== id ? `${T.N[f].name} › ${nameOf(id)}` : nameOf(id);
+      const text = fitText(ctx, `${far ? '→' : '←'} ${name}`, 220);
+      if (!text || named.has(text)) continue;
+      const w = textWidth(ctx, text) + 14, h = 20;
+      const side = Math.abs(ix - x0) < 1 || Math.abs(ix - x1) < 1;
+      const hit = (bx, by) => taken.some((r) => bx < r[0] + r[2] + 4 && r[0] < bx + w + 4 && by < r[1] + r[3] + 2 && r[1] < by + h + 2);
+      let bx = 0, by = 0, room = false;
+      for (let j = 0; j < 9 && !room; j++) {
+        const off = (j % 2 ? 1 : -1) * Math.ceil(j / 2) * (side ? h + 3 : w + 4);
+        bx = clamp(ix - w / 2 + (side ? 0 : off), x0, x1 - w);
+        by = clamp(iy - h / 2 + (side ? off : 0), y0, y1 - h);
+        room = !hit(bx, by);
+      }
+      if (!room) continue;
+      taken.push([bx, by, w, h]);
+      named.add(text);
+      ctx.fillStyle = th.halo;
+      ctx.strokeStyle = css(e.color, 0.9);
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.roundRect(bx, by, w, h, 10);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = th.ink;
+      ctx.fillText(text, bx + 7, by + h / 2 + 0.5);
+    }
   }
 }
 
@@ -2768,7 +2889,7 @@ function hideTip() { const tip = $('#tip'); tip.hidden = true; tip.dataset.key =
 function seg(options, value, pick, { label, cls = '', title } = {}) {
   return h('div', { class: `seg ${cls}`, role: 'group', 'aria-label': title ?? label },
     label ? h('span', { class: 'label' }, label) : null,
-    options.map((o) => h('button', { 'aria-pressed': String(o.id === value), title: o.about ? `${o.about}${o.key ? ` (${o.key})` : ''}` : o.name, onclick: () => pick(o.id) }, o.name)));
+    options.map((o) => h('button', { 'aria-pressed': String(o.id === value), disabled: o.disabled, title: o.about ? `${o.about}${o.key ? ` (${o.key})` : ''}` : o.name, onclick: () => pick(o.id) }, o.name)));
 }
 
 function picker(options, value, pick, { label, cls = '' } = {}) {
@@ -3775,7 +3896,9 @@ function askMove(id, target, x, y) {
   pop(x, y,
     symbol ? h('p', null, 'Move ', h('b', null, nameOf(id)), ' from ', h('b', null, from.name), ' to ', h('b', null, t.name), '?')
       : h('p', null, 'Move ', h('b', null, n.name), ' into ', h('b', null, `${t.path || t.name}/`), '?'),
-    h('div', { class: 'note' }, symbol ? 'Its doc comments and decorators go with it. Both files are staged.' : 'The move is staged. Ask the agent to fix imports and references too.'),
+    h('div', { class: 'note' }, symbol
+      ? 'Its doc comments, decorators, and imports go with it; files that import it follow. Everything is staged.'
+      : 'The move is staged with fixed JS/TS, Python, and C# imports. Ask the agent for anything else.'),
     h('div', { class: 'row end' },
       h('button', { class: 'btn small ghost', onclick: unpop }, 'Cancel'),
       h('button', { class: 'btn small', onclick: () => { unpop(); hub.emit('stage.move', { key: n.key, to: t.key }); } }, 'Move only'),
@@ -3784,8 +3907,8 @@ function askMove(id, target, x, y) {
         const r = await wire.ask('stage.move', { key: n.key, to: t.key });
         if (r?.error) return;
         const prompt = symbol
-          ? `I moved ${n.name} from ${from.key} to ${t.key} (staged). Update every import and reference so the code still works.`
-          : `I moved ${n.key} into ${t.key}/ (staged). Update every import and reference so the code still works.`;
+          ? `I moved ${n.name} from ${from.key} to ${t.key} (staged, with JS/TS, Python, and C# imports fixed). Check the staged changes and fix any import or reference that still points to the old place, so the code still works.`
+          : `I moved ${n.key} into ${t.key}/ (staged, with JS/TS, Python, and C# imports fixed). Check the staged changes and fix any import or reference that still points to the old place (other languages, dynamic imports, paths in config), so the code still works.`;
         hub.emit('agent.ask', { prompt, set: { ...S.emptySet(), nodes: symbol ? [from.key, t.key] : [t.key] } });
       } }, 'Move + fix')));
 }
@@ -4066,7 +4189,17 @@ function drawSetupBox() {
   style.value = c.style ?? '';
   const result = h('div', { class: 'note' });
   const themeSeg = seg([{ id: 'dark', name: 'Dark' }, { id: 'light', name: 'Light' }, { id: 'system', name: 'System' }], state.theme, (id) => { hub.emit('view.theme', id); drawSetupBox(); }, { cls: 'boxed' });
-  const patch = () => ({ endpoint: endpoint.value.trim(), model: model.value.trim(), style: style.value, maxTurns: +turns.value || 40, ...(key.value ? { apiKey: key.value.trim() } : {}) });
+  // The parser is kept here until Save, which rescans every repo when it changed.
+  let parser = c.parser ?? 'built-in';
+  const parsers = () => seg([
+    { id: 'built-in', name: 'Built-in', about: 'Fast heuristics for every language' },
+    { id: 'tree-sitter', name: 'Tree-sitter', about: 'Exact syntax trees; slower scans', disabled: !c.trees?.ready },
+  ], parser, (id) => { parser = id; parserSeg.replaceChildren(parsers()); }, { cls: 'boxed', title: 'Parser' });
+  const parserSeg = h('div', null, parsers());
+  const parserHint = c.trees?.ready
+    ? `Tree-sitter reads exact syntax trees for ${c.trees.langs.join(', ')}; other languages keep the built-in parser. Changing it rescans every repo.`
+    : 'Tree-sitter needs the optional @vscode/tree-sitter-wasm package: run npm install.';
+  const patch = () => ({ endpoint: endpoint.value.trim(), model: model.value.trim(), style: style.value, maxTurns: +turns.value || 40, parser, ...(key.value ? { apiKey: key.value.trim() } : {}) });
   box.replaceChildren(
     h('div', { class: 'box-head' }, h('h2', null, 'Settings'), h('p', null, 'The agent talks to any OpenAI-compatible endpoint.')),
     h('div', { class: 'box-body' },
@@ -4076,6 +4209,7 @@ function drawSetupBox() {
       f('Max steps', turns, 'Upper limit on agent turns per request.'),
       f('Style guide', style, 'Sent with every request. The agent follows it when it edits.'),
       h('div', { class: 'field' }, h('label', null, 'Theme'), themeSeg),
+      h('div', { class: 'field' }, h('label', null, 'Parser'), parserSeg, h('div', { class: 'hint' }, parserHint)),
       result),
     h('div', { class: 'box-foot' },
       h('button', { class: 'btn ghost', style: { marginRight: 'auto' }, onclick: async () => { await wire.ask('config.set', patch()); result.textContent = 'Testing…'; const r = await wire.ask('agent.test'); result.textContent = r.ok ? `Connected. Model replied: ${r.text}` : `Failed: ${r.text}`; result.style.color = r.ok ? STATUS.good : STATUS.critical; } }, 'Test'),
