@@ -2,6 +2,7 @@
 
 Sorted by impact, highest first.
 
+- [perf] Ignore common cache and package directories such as `.venv`, `node_modules`, `__pycache__`, etc. Consider driving exclusions using .gitignore entries.
 - [parsing] Add Tree-sitter (WASM) parsers as an option for exact syntax trees where the built-in heuristics fall short: receiver-typed calls, macros, generics-heavy C++, decorators, nested lambdas.
 - [linking] Resolve calls by receiver type (`store.Find` → `IOrderStore.Find`) instead of by name, to cut false and missing call links in large OOP code.
 - [repos] Open remote repos: clone a git URL into a cache folder, keep it fetched, and show the branch.
